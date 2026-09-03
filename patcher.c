@@ -26,6 +26,38 @@ static unsigned char thumb_branch_thunk[] = { 0x00, 0x4b, 0x18, 0x47 };
 static unsigned char arm_branch_thunk[] = { 0x00, 0x30, 0x9f, 0xe5, 0x13, 0xff, 0x2f, 0xe1 };
 
 static unsigned char write_sram_signature[] = { 0x30, 0xB5, 0x05, 0x1C, 0x0C, 0x1C, 0x13, 0x1C, 0x0B, 0x4A, 0x10, 0x88, 0x0B, 0x49, 0x08, 0x40};
+/* I byte agli indici 8 e 12 sono l'immediato di due "ldr rX, [pc, #imm]"
+ * che caricano il registro WAITCNT e la sua maschera da una literal pool
+ * adiacente. Quella distanza cambia leggermente a seconda della posizione
+ * di ciascuna copia della funzione nel codice compilato, quindi il valore
+ * esatto di questi due byte NON e' affidabile per identificare la
+ * funzione: li trattiamo come wildcard (1 = ignora). Trovato analizzando
+ * manualmente il gioco: la stessa funzione generica di copia compare 3
+ * volte nella ROM con offset di literal pool leggermente diversi, e il
+ * confronto byte-per-byte originale ne intercettava solo 2 su 3. */
+static int write_sram_signature_wild[] = { 0,0,0,0,0,0,0,0, 1,0,0,0, 1,0,0,0 };
+
+/* Byte 34-37 (relativi all'inizio della funzione, quindi oltre le 16
+ * della firma sopra) distinguono in modo affidabile la variante
+ * "scrittura" (copia: ldrb+strb) dalla variante "verifica" (confronto:
+ * ldrb+ldrb+cmp), che condividono lo stesso prologo di impostazione
+ * WAITCNT ma hanno un corpo del ciclo diverso. A differenza dei byte 8
+ * e 12, questi non dipendono dalla posizione della literal pool: sono
+ * istruzioni che usano solo registri, quindi la loro codifica resta
+ * identica ovunque si trovi la funzione nella ROM. */
+static unsigned char write_body_pattern[] = { 0x28, 0x78, 0x20, 0x70 };
+static unsigned char verify_body_pattern[] = { 0x21, 0x78, 0x28, 0x78 };
+#define SRAM_BODY_PATTERN_OFFSET 34
+
+static int memcmp_wild(const uint8_t *data, const unsigned char *sig, const int *wild, size_t len)
+{
+    for (size_t i = 0; i < len; ++i)
+    {
+        if (!wild[i] && data[i] != sig[i])
+            return 1; /* diverso, come memcmp che ritorna non-zero */
+    }
+    return 0; /* uguale (rispettando le wildcard) */
+}
 static unsigned char write_sram2_signature[] = { 0x80, 0xb5, 0x83, 0xb0, 0x6f, 0x46, 0x38, 0x60, 0x79, 0x60, 0xba, 0x60, 0x09, 0x48, 0x09, 0x49 };
 static unsigned char write_sram_ram_signature[] = { 0x04, 0xC0, 0x90, 0xE4, 0x01, 0xC0, 0xC1, 0xE4, 0x2C, 0xC4, 0xA0, 0xE1, 0x01, 0xC0, 0xC1, 0xE4 };
 
@@ -150,12 +182,29 @@ int main(int argc, char **argv)
     for (uint8_t *write_location = rom; write_location < rom + romsize - 64; write_location += 2)
     {
         int rom_offset = write_location - rom;
-		if (!memcmp(write_location, write_sram_signature, sizeof write_sram_signature))
+		if (!memcmp_wild(write_location, write_sram_signature, write_sram_signature_wild, sizeof write_sram_signature))
 		{
-            found_write_location = 1;
-            printf("WriteSram identified at offset %lx, patching\n", write_location - rom);
-            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
-            1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
+            int is_verify = !memcmp(write_location + SRAM_BODY_PATTERN_OFFSET, verify_body_pattern, sizeof verify_body_pattern);
+            int is_write = !memcmp(write_location + SRAM_BODY_PATTERN_OFFSET, write_body_pattern, sizeof write_body_pattern);
+
+            if (is_verify)
+            {
+                found_write_location = 1;
+                printf("VerifySram (variante generica) identificata a offset %lx, patching\n", write_location - rom);
+                memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+                1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
+            }
+            else if (is_write)
+            {
+                found_write_location = 1;
+                printf("WriteSram identified at offset %lx, patching\n", write_location - rom);
+                memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+                1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
+            }
+            /* se non corrisponde a nessuna delle due varianti note, non
+             * tocchiamo nulla: meglio lasciare intonsa una funzione che
+             * non riconosciamo con certezza piuttosto che patcharla
+             * a caso */
 
 		}
         if (!memcmp(write_location, write_sram2_signature, sizeof write_sram2_signature))
