@@ -1,6 +1,6 @@
 # GBA Flash Patcher
 
-Patches an EEPROM or SRAM GBA game to save on Flash 512K and 1M
+Patches an EEPROM or SRAM GBA game to save on Flash 512K and 1Mbit
 
 ## Additional fixes (fork)
 
