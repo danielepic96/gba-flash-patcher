@@ -29,3 +29,24 @@ Patches an EEPROM or SRAM GBA game to save on Flash 512K and 1Mbit
   on real Macronix hardware.
 
 Tested and confirmed working on a ChisCart v1.1 (1Mbit Macronix MX29L010)
+
+## EEPROM support fixes (from v1.1)
+
+This fork also fixes EEPROM save support, which previously often required
+a two-step workaround (converting to SRAM with GBATA first, then patching
+with this tool). The patcher simply couldn't recognize the real EEPROM
+read/write/identify functions in several games — different compilers
+produce slightly different machine code for the same operation, and the
+original signatures only matched one specific form.
+
+Added a clean way to handle multiple known variants of the same function
+side by side, plus several new variants found by analyzing real games —
+most of the missing cases were on the write side. Also fixed how the
+EEPROM metadata pointer gets located, so it resolves correctly regardless
+of which variant matched.
+
+Tested and confirmed fully working (read, write, verify, identify all
+found and patched) on several different EEPROM games. If you hit a game
+where the write function still isn't found, it's most likely just another
+untested compiled variant — happened four times already, so more are
+likely out there.
