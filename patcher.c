@@ -58,6 +58,20 @@ static int memcmp_wild(const uint8_t *data, const unsigned char *sig, const int 
     }
     return 0; /* uguale (rispettando le wildcard) */
 }
+
+/* Decodifica correttamente la seconda "ldr rX, [pc, #imm8]" (offset
+ * relativo 12 dall'inizio del match di identify_eeprom) per risalire al
+ * vero valore puntato, invece di assumere un offset fisso che vale solo
+ * se l'immediato coincide con quello dell'esempio originale. */
+static uint32_t resolve_eeprom_meta_ptr(uint8_t *rom, long rom_offset)
+{
+    uint8_t imm2 = rom[rom_offset + 12];
+    uint32_t instr2_addr = 0x08000000 + rom_offset + 12;
+    uint32_t target2 = ((instr2_addr + 4) & ~3u) + imm2 * 4;
+    uint32_t rom_target_offset = target2 - 0x08000000;
+    return *(uint32_t *) &rom[rom_target_offset];
+}
+
 static unsigned char write_sram2_signature[] = { 0x80, 0xb5, 0x83, 0xb0, 0x6f, 0x46, 0x38, 0x60, 0x79, 0x60, 0xba, 0x60, 0x09, 0x48, 0x09, 0x49 };
 static unsigned char write_sram_ram_signature[] = { 0x04, 0xC0, 0x90, 0xE4, 0x01, 0xC0, 0xC1, 0xE4, 0x2C, 0xC4, 0xA0, 0xE1, 0x01, 0xC0, 0xC1, 0xE4 };
 
@@ -65,13 +79,87 @@ static unsigned char read_sram_signature[] = { 0x70, 0xB5, 0xA0, 0xB0, 0x04, 0x1
 
 static unsigned char verify_sram_signature[] = { 0x70, 0xB5, 0xB0, 0xB0, 0x04, 0x1C, 0x0D, 0x1C, 0x16, 0x1C, 0x08, 0x4A, 0x10, 0x88, 0x08, 0x49 };
 
-static unsigned char write_eeprom_signature[] = { 0x70, 0xB5, 0x00, 0x04, 0x0A, 0x1C, 0x40, 0x0B, 0xE0, 0x21, 0x09, 0x05, 0x41, 0x18, 0x07, 0x31, 0x00, 0x23, 0x10, 0x78};
+/* Ogni "operazione" (scrittura/lettura/identificazione EEPROM) puo' avere
+ * piu' varianti byte-per-byte a seconda del compilatore/versione usati dal
+ * gioco. Le raggruppiamo qui invece di avere blocchi duplicati sparsi nel
+ * loop di scansione. wild puo' essere NULL se la variante e' un confronto
+ * esatto, senza byte in wildcard. */
+typedef struct {
+    const unsigned char *sig;
+    const int *wild;
+    size_t len;
+} sig_variant;
 
-static unsigned char read_eeprom_signature[] = { 0x70, 0xB5, 0x00, 0x04, 0x0A, 0x1C, 0x40, 0x0B, 0xE0, 0x21, 0x09, 0x05, 0x41, 0x18, 0x07, 0x31 };
+static int match_any_variant(const uint8_t *data, const sig_variant *variants, int count)
+{
+    for (int v = 0; v < count; ++v)
+    {
+        const sig_variant *sv = &variants[v];
+        int matched = sv->wild
+            ? !memcmp_wild(data, sv->sig, sv->wild, sv->len)
+            : !memcmp(data, sv->sig, sv->len);
+        if (matched)
+            return 1;
+    }
+    return 0;
+}
+
+/* --- ProgramEepromDword (scrittura EEPROM) --- */
+static unsigned char write_eeprom_sig_a[] = { 0x70, 0xB5, 0x00, 0x04, 0x0A, 0x1C, 0x40, 0x0B, 0xE0, 0x21, 0x09, 0x05, 0x41, 0x18, 0x07, 0x31, 0x00, 0x23, 0x10, 0x78};
+/* Variante trovata analizzando The Legend of Zelda: The Minish Cap (EEPROM
+ * nativo): il compilatore usato per questo gioco genera un prologo diverso
+ * (due istruzioni extra di setup subito dopo il push), quindi la firma
+ * sopra non trova mai un riscontro qui. Il byte in wildcard e' l'immediato
+ * di una "ldr rX, [pc, #imm]" che dipende dalla distanza dalla literal
+ * pool, quindi cambia in base alla posizione della funzione nel codice
+ * compilato. */
+static unsigned char write_eeprom_sig_b[] = { 0xF0, 0xB5, 0xAC, 0xB0, 0x0D, 0x1C, 0x00, 0x04, 0x01, 0x0C, 0x12, 0x06, 0x17, 0x0E, 0x00, 0x48, 0x00, 0x68, 0x80, 0x88, 0x81, 0x42, 0x05, 0xD3 };
+static int         write_eeprom_sig_b_wild[] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1, 0,0,0,0,0,0,0,0,0 };
+/* Terza variante, trovata analizzando Yggdra Union (EEPROM nativo): due
+ * istruzioni extra rispetto alla variante B ("mov r7,r8; push {r7}" subito
+ * dopo il push iniziale) e un'allocazione di registri diversa. Stesso
+ * genere di compilatore/versione diversi da entrambe le varianti sopra. */
+static unsigned char write_eeprom_sig_c[] = { 0xF0, 0xB5, 0x47, 0x46, 0x80, 0xB4, 0xAC, 0xB0, 0x0E, 0x1C, 0x00, 0x04, 0x05, 0x0C, 0x12, 0x06, 0x12, 0x0E, 0x90, 0x46, 0x00, 0x48, 0x00, 0x68, 0x80, 0x88, 0x85, 0x42, 0x06, 0xD3 };
+static int         write_eeprom_sig_c_wild[] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1, 0,0,0,0,0,0,0,0,0 };
+/* Quarta variante, trovata analizzando Super Mario Advance 2 - Super Mario
+ * World: prologo piu' snello (push {r4,r5,lr}, solo 3 registri) rispetto
+ * alle altre tre varianti, con un'allocazione di stack diversa (164 byte). */
+static unsigned char write_eeprom_sig_d[] = { 0x30, 0xB5, 0xA9, 0xB0, 0x0D, 0x1C, 0x00, 0x04, 0x04, 0x0C, 0x00, 0x48, 0x00, 0x68, 0x80, 0x88, 0x84, 0x42, 0x05, 0xD3 };
+static int         write_eeprom_sig_d_wild[] = { 0,0,0,0,0,0,0,0,0,0, 1, 0,0,0,0,0,0,0,0,0 };
+static const sig_variant write_eeprom_variants[] = {
+    { write_eeprom_sig_a, NULL, sizeof write_eeprom_sig_a },
+    { write_eeprom_sig_b, write_eeprom_sig_b_wild, sizeof write_eeprom_sig_b },
+    { write_eeprom_sig_c, write_eeprom_sig_c_wild, sizeof write_eeprom_sig_c },
+    { write_eeprom_sig_d, write_eeprom_sig_d_wild, sizeof write_eeprom_sig_d },
+};
+
+/* --- ReadEepromDword (lettura EEPROM) --- */
+static unsigned char read_eeprom_sig_a[] = { 0x70, 0xB5, 0x00, 0x04, 0x0A, 0x1C, 0x40, 0x0B, 0xE0, 0x21, 0x09, 0x05, 0x41, 0x18, 0x07, 0x31 };
+/* Variante Minish Cap, stesso motivo della scrittura sopra. */
+static unsigned char read_eeprom_sig_b[] = { 0x70, 0xB5, 0xA2, 0xB0, 0x0D, 0x1C, 0x00, 0x04, 0x03, 0x0C, 0x00, 0x48, 0x00, 0x68, 0x80, 0x88, 0x83, 0x42, 0x05, 0xD3 };
+static int         read_eeprom_sig_b_wild[] = { 0,0,0,0,0,0,0,0,0,0, 1, 0,0,0,0,0,0,0,0,0 };
+static const sig_variant read_eeprom_variants[] = {
+    { read_eeprom_sig_a, NULL, sizeof read_eeprom_sig_a },
+    { read_eeprom_sig_b, read_eeprom_sig_b_wild, sizeof read_eeprom_sig_b },
+};
 
 static unsigned char verify_eeprom_signature[] = { 0x30, 0xB5, 0x82, 0xB0, 0x0C, 0x1C, 0x00, 0x04, 0x01, 0x0C, 0x00, 0x25, 0x03, 0x48, 0x00, 0x68 };
 
-static unsigned char identify_eeprom_signature[] = { 0x00, 0x04, 0x00, 0x0C, 0x00, 0x22, 0x04, 0x28, 0x08, 0xD1, 0x02, 0x49, 0x02, 0x48, 0x08, 0x60 };
+/* --- IdentifyEeprom --- */
+static unsigned char identify_eeprom_sig_a[] = { 0x00, 0x04, 0x00, 0x0C, 0x00, 0x22, 0x04, 0x28, 0x08, 0xD1, 0x02, 0x49, 0x02, 0x48, 0x08, 0x60 };
+/* Variante Minish Cap: i byte agli indici 8 e 10 sono l'immediato di un
+ * salto condizionale e di una "ldr r1, [pc, #imm]", entrambi dipendenti
+ * dalla posizione nel codice compilato. Il byte all'indice 12 (secondo
+ * "ldr", quello che punta al vero valore che ci interessa) resta invece
+ * fisso in entrambe le varianti: e' per questo che resolve_eeprom_meta_ptr
+ * funziona identicamente per entrambe, senza bisogno di un offset fisso
+ * diverso per ciascuna. */
+static unsigned char identify_eeprom_sig_b[] = { 0x00, 0x04, 0x00, 0x0C, 0x00, 0x22, 0x04, 0x28, 0x00, 0xD1, 0x00, 0x49, 0x02, 0x48, 0x08, 0x60 };
+static int         identify_eeprom_sig_b_wild[] = { 0,0,0,0,0,0,0,0, 1,0, 1,0, 0,0,0,0 };
+static const sig_variant identify_eeprom_variants[] = {
+    { identify_eeprom_sig_a, NULL, sizeof identify_eeprom_sig_a },
+    { identify_eeprom_sig_b, identify_eeprom_sig_b_wild, sizeof identify_eeprom_sig_b },
+};
 
 
 static uint8_t *memfind(uint8_t *haystack, size_t haystack_size, uint8_t *needle, size_t needle_size, int stride)
@@ -190,7 +278,7 @@ int main(int argc, char **argv)
             if (is_verify)
             {
                 found_write_location = 1;
-                printf("VerifySram (variante generica) identificata a offset %lx, patching\n", write_location - rom);
+                printf("VerifySram (generic variant) identified at offset %lx, patching\n", write_location - rom);
                 memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
                 1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
             }
@@ -237,32 +325,33 @@ int main(int argc, char **argv)
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
 		}
-		if (!memcmp(write_location, write_eeprom_signature, sizeof write_eeprom_signature))
+		if (match_any_variant(write_location, write_eeprom_variants, 4))
 		{
             found_write_location = 1;
-            printf("SRAM-patched ProgramEepromDword identified at offset %lx, patching\n", write_location - rom);
+            printf("ProgramEepromDword identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_EEPROM_PATCHED[(uint32_t*) payload_bin];
 		}
-        if (!memcmp(write_location, read_eeprom_signature, sizeof read_eeprom_signature))
+        if (match_any_variant(write_location, read_eeprom_variants, 2))
 		{
             found_write_location = 1;
-            printf("SRAM-patched ReadEepromDword identified at offset %lx, patching\n", write_location - rom);
+            printf("ReadEepromDword identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + READ_EEPROM_PATCHED[(uint32_t*) payload_bin];
 		}
         if (!memcmp(write_location, verify_eeprom_signature, sizeof verify_eeprom_signature))
 		{
             found_write_location = 1;
-            printf("SRAM-patched VerifyEepromDword identified at offset %lx, patching\n", write_location - rom);
+            printf("VerifyEepromDword identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_EEPROM_PATCHED[(uint32_t*) payload_bin];
 		}
-        if (!memcmp(write_location, identify_eeprom_signature, sizeof identify_eeprom_signature))
+        if (match_any_variant(write_location, identify_eeprom_variants, 2))
         {
             found_write_location = 1;
-            EEPROM_META[(uint32_t*) &rom[payload_base]] = 5[(uint32_t*) write_location];
-            printf("SRAM-patched IdentifyEeprom identified at offset %lx, RAM address of eeprom info is %x\n", write_location - rom, 5[(uint32_t*) write_location]);
+            uint32_t meta_ptr = resolve_eeprom_meta_ptr(rom, write_location - rom);
+            EEPROM_META[(uint32_t*) &rom[payload_base]] = meta_ptr;
+            printf("IdentifyEeprom identified at offset %lx, RAM address of eeprom info is %x\n", write_location - rom, meta_ptr);
         }
 	}
     if (!found_write_location)
