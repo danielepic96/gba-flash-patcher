@@ -99,9 +99,9 @@ static int match_any_variant(const uint8_t *data, const sig_variant *variants, i
             ? !memcmp_wild(data, sv->sig, sv->wild, sv->len)
             : !memcmp(data, sv->sig, sv->len);
         if (matched)
-            return 1;
+            return v; /* indice della variante trovata */
     }
-    return 0;
+    return -1; /* nessuna corrispondenza */
 }
 
 /* --- ProgramEepromDword (scrittura EEPROM) --- */
@@ -126,11 +126,18 @@ static int         write_eeprom_sig_c_wild[] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
  * alle altre tre varianti, con un'allocazione di stack diversa (164 byte). */
 static unsigned char write_eeprom_sig_d[] = { 0x30, 0xB5, 0xA9, 0xB0, 0x0D, 0x1C, 0x00, 0x04, 0x04, 0x0C, 0x00, 0x48, 0x00, 0x68, 0x80, 0x88, 0x84, 0x42, 0x05, 0xD3 };
 static int         write_eeprom_sig_d_wild[] = { 0,0,0,0,0,0,0,0,0,0, 1, 0,0,0,0,0,0,0,0,0 };
+/* Quinta variante, trovata in "2 in 1 - Spyro: Season of Ice & Season of
+ * Flame": stessa forma della quarta ma con un calcolo di offset in piu'
+ * (ldr r4,[pc,#imm]; adds r4,r0,r4) prima del solito controllo — probabile
+ * gestione di piu' blocchi di salvataggio in un'unica ROM 2-in-1. */
+static unsigned char write_eeprom_sig_e[] = { 0x30, 0xB5, 0xA9, 0xB0, 0x0D, 0x1C, 0x00, 0x4C, 0x04, 0x19, 0x00, 0x48, 0x00, 0x68, 0x80, 0x88, 0x84, 0x42, 0x05, 0xD3 };
+static int         write_eeprom_sig_e_wild[] = { 0,0,0,0,0,0, 1,0, 0,0, 1, 0,0,0,0,0,0,0,0,0 };
 static const sig_variant write_eeprom_variants[] = {
     { write_eeprom_sig_a, NULL, sizeof write_eeprom_sig_a },
     { write_eeprom_sig_b, write_eeprom_sig_b_wild, sizeof write_eeprom_sig_b },
     { write_eeprom_sig_c, write_eeprom_sig_c_wild, sizeof write_eeprom_sig_c },
     { write_eeprom_sig_d, write_eeprom_sig_d_wild, sizeof write_eeprom_sig_d },
+    { write_eeprom_sig_e, write_eeprom_sig_e_wild, sizeof write_eeprom_sig_e },
 };
 
 /* --- ReadEepromDword (lettura EEPROM) --- */
@@ -138,9 +145,15 @@ static unsigned char read_eeprom_sig_a[] = { 0x70, 0xB5, 0x00, 0x04, 0x0A, 0x1C,
 /* Variante Minish Cap, stesso motivo della scrittura sopra. */
 static unsigned char read_eeprom_sig_b[] = { 0x70, 0xB5, 0xA2, 0xB0, 0x0D, 0x1C, 0x00, 0x04, 0x03, 0x0C, 0x00, 0x48, 0x00, 0x68, 0x80, 0x88, 0x83, 0x42, 0x05, 0xD3 };
 static int         read_eeprom_sig_b_wild[] = { 0,0,0,0,0,0,0,0,0,0, 1, 0,0,0,0,0,0,0,0,0 };
+/* Terza variante, trovata in "2 in 1 - Spyro: Season of Ice & Season of
+ * Flame": stesso calcolo di offset in piu' visto nella scrittura, stesso
+ * probabile motivo (piu' blocchi di salvataggio in una ROM 2-in-1). */
+static unsigned char read_eeprom_sig_c[] = { 0x70, 0xB5, 0xA2, 0xB0, 0x0D, 0x1C, 0x04, 0x4B, 0xC3, 0x18, 0x28, 0x48, 0x00, 0x68, 0x80, 0x88, 0x83, 0x42, 0x05, 0xD3 };
+static int         read_eeprom_sig_c_wild[] = { 0,0,0,0,0,0, 1,0, 0,0, 1, 0,0,0,0,0,0,0,0,0 };
 static const sig_variant read_eeprom_variants[] = {
     { read_eeprom_sig_a, NULL, sizeof read_eeprom_sig_a },
     { read_eeprom_sig_b, read_eeprom_sig_b_wild, sizeof read_eeprom_sig_b },
+    { read_eeprom_sig_c, read_eeprom_sig_c_wild, sizeof read_eeprom_sig_c },
 };
 
 static unsigned char verify_eeprom_signature[] = { 0x30, 0xB5, 0x82, 0xB0, 0x0C, 0x1C, 0x00, 0x04, 0x01, 0x0C, 0x00, 0x25, 0x03, 0x48, 0x00, 0x68 };
@@ -156,11 +169,33 @@ static unsigned char identify_eeprom_sig_a[] = { 0x00, 0x04, 0x00, 0x0C, 0x00, 0
  * diverso per ciascuna. */
 static unsigned char identify_eeprom_sig_b[] = { 0x00, 0x04, 0x00, 0x0C, 0x00, 0x22, 0x04, 0x28, 0x00, 0xD1, 0x00, 0x49, 0x02, 0x48, 0x08, 0x60 };
 static int         identify_eeprom_sig_b_wild[] = { 0,0,0,0,0,0,0,0, 1,0, 1,0, 0,0,0,0 };
+/* Terza variante, trovata in "2 in 1 - Spyro: Season of Ice & Season of
+ * Flame": qui il compilatore genera un salto incondizionato (b) invece di
+ * uno condizionato (bne) in quel punto - un'istruzione diversa, non solo
+ * un offset diverso, quindi il byte dell'opcode (indice 9) resta fisso a
+ * 0xE0 in questa variante invece di essere in wildcard. */
+static unsigned char identify_eeprom_sig_c[] = { 0x00, 0x04, 0x00, 0x0C, 0x00, 0x22, 0x04, 0x28, 0x00, 0xE0, 0x00, 0x49, 0x02, 0x48, 0x08, 0x60 };
+static int         identify_eeprom_sig_c_wild[] = { 0,0,0,0,0,0,0,0, 1,0, 1,0, 0,0,0,0 };
 static const sig_variant identify_eeprom_variants[] = {
     { identify_eeprom_sig_a, NULL, sizeof identify_eeprom_sig_a },
     { identify_eeprom_sig_b, identify_eeprom_sig_b_wild, sizeof identify_eeprom_sig_b },
+    { identify_eeprom_sig_c, identify_eeprom_sig_c_wild, sizeof identify_eeprom_sig_c },
 };
 
+
+/* Cerca una sottostringa ASCII ovunque nella ROM (usata per leggere le
+ * stringhe identificative di tipo di salvataggio nell'header, es.
+ * "EEPROM_V..." o "SRAM_V..."). */
+static int rom_contains(uint8_t *rom, size_t romsize, const char *needle)
+{
+    size_t needle_len = strlen(needle);
+    for (size_t i = 0; i + needle_len <= romsize; ++i)
+    {
+        if (!memcmp(rom + i, needle, needle_len))
+            return 1;
+    }
+    return 0;
+}
 
 static uint8_t *memfind(uint8_t *haystack, size_t haystack_size, uint8_t *needle, size_t needle_size, int stride)
 {
@@ -264,13 +299,59 @@ int main(int argc, char **argv)
 	
 	printf("Installing payload at offset %x\n", payload_base);
 	memcpy(rom + payload_base, payload_bin, payload_bin_len);
-	
+
+    /* Alcuni giochi (es. "Rocky") contengono nella ROM sia una stringa
+     * "EEPROM_V..." sia una "SRAM_V..." nell'header - probabile residuo di
+     * un motore/SDK condiviso tra piu' release con tipi di salvataggio
+     * diversi, di cui una sola e' realmente usata in questa build.
+     * Patchare il lato non pertinente puo' rompere codice non collegato
+     * al salvataggio che condivide per coincidenza la stessa forma di
+     * funzione generica, causando crash all'avvio (visto esattamente su
+     * Rocky, dove ENTRAMBE le stringhe erano presenti). Una cartuccia GBA
+     * fisica ha comunque un solo chip di salvataggio, quindi diamo
+     * sempre precedenza all'EEPROM quando la sua stringa e' presente,
+     * indipendentemente dal fatto che compaia anche quella SRAM. Solo se
+     * l'header non dichiara EEPROM proviamo la scansione SRAM; se non
+     * dichiara nulla di riconoscibile, proviamo comunque tutto come
+     * prima (rete di sicurezza per ROM senza header pulito). */
+    int has_eeprom_id = rom_contains(rom, romsize, "EEPROM_V");
+    int has_sram_id = rom_contains(rom, romsize, "SRAM_V") || rom_contains(rom, romsize, "SRAM_F_V");
+    /* GBATA, quando converte un gioco da EEPROM a SRAM, lascia l'header
+     * originale invariato (ancora "EEPROM_V...", solo con un marcatore
+     * "(Patched)"): non aggiunge una vera stringa SRAM_V. Quindi la sola
+     * presenza di EEPROM_V non basta per escludere la scansione SRAM,
+     * altrimenti romperemmo proprio questo caso d'uso legittimo. Saltiamo
+     * la scansione SRAM solo quando troviamo ENTRAMBE le stringhe native
+     * insieme (il caso ambiguo visto su Rocky, dove SRAM_V e' una vera
+     * stringa nativa, non un residuo di conversione). */
+    int try_eeprom = has_eeprom_id || !has_sram_id;
+    int try_sram = !(has_eeprom_id && has_sram_id);
+    if (has_eeprom_id && has_sram_id)
+        puts("Header declares both EEPROM and SRAM - assuming EEPROM is the real save type and skipping SRAM signature scan");
+
+    /* Controllo preliminare su tutta la ROM: la variante 0 (sig_a) di
+     * ProgramEepromDword/ReadEepromDword corrisponde esattamente al
+     * codice che GBATA produce convertendo EEPROM in SRAM. Se la
+     * troviamo anche una sola volta, l'intera ROM appartiene con ogni
+     * probabilita' a quel contesto - quindi etichettiamo allo stesso
+     * modo anche identify e verify, anche se il loro codice specifico
+     * non risulta toccato da GBATA (che in pratica lascia identify e
+     * verify invariati, convertendo solo read/write). */
+    int gbata_converted = 0;
+    for (uint8_t *scan = rom; scan < rom + romsize - 64 && !gbata_converted; scan += 2)
+    {
+        if (!memcmp(scan, write_eeprom_sig_a, sizeof write_eeprom_sig_a))
+            gbata_converted = 1;
+        else if (!memcmp(scan, read_eeprom_sig_a, sizeof read_eeprom_sig_a))
+            gbata_converted = 1;
+    }
+
 	// Patch any write functions 
     int found_write_location = 0;
     for (uint8_t *write_location = rom; write_location < rom + romsize - 64; write_location += 2)
     {
         int rom_offset = write_location - rom;
-		if (!memcmp_wild(write_location, write_sram_signature, write_sram_signature_wild, sizeof write_sram_signature))
+		if (try_sram && !memcmp_wild(write_location, write_sram_signature, write_sram_signature_wild, sizeof write_sram_signature))
 		{
             int is_verify = !memcmp(write_location + SRAM_BODY_PATTERN_OFFSET, verify_body_pattern, sizeof verify_body_pattern);
             int is_write = !memcmp(write_location + SRAM_BODY_PATTERN_OFFSET, write_body_pattern, sizeof write_body_pattern);
@@ -295,7 +376,7 @@ int main(int argc, char **argv)
              * a caso */
 
 		}
-        if (!memcmp(write_location, write_sram2_signature, sizeof write_sram2_signature))
+        if (try_sram && !memcmp(write_location, write_sram2_signature, sizeof write_sram2_signature))
 		{
             found_write_location = 1;
             printf("WriteSram 2 identified at offset %lx, patching\n", write_location - rom);
@@ -303,14 +384,14 @@ int main(int argc, char **argv)
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
 
 		}
-		if (!memcmp(write_location, write_sram_ram_signature, sizeof write_sram_ram_signature))
+		if (try_sram && !memcmp(write_location, write_sram_ram_signature, sizeof write_sram_ram_signature))
 		{
             found_write_location = 1;
             printf("WriteSramFast identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, arm_branch_thunk, sizeof arm_branch_thunk);
             2[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
 		}
-        if (!memcmp(write_location, read_sram_signature, sizeof read_sram_signature))
+        if (try_sram && !memcmp(write_location, read_sram_signature, sizeof read_sram_signature))
 		{
             found_write_location = 1;
             printf("ReadSram identified at offset %lx, patching\n", write_location - rom);
@@ -318,40 +399,50 @@ int main(int argc, char **argv)
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + READ_SRAM_PATCHED[(uint32_t*) payload_bin];
 
 		}
-        if (!memcmp(write_location, verify_sram_signature, sizeof verify_sram_signature))
+        if (try_sram && !memcmp(write_location, verify_sram_signature, sizeof verify_sram_signature))
 		{
             found_write_location = 1;
             printf("VerifySram identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
 		}
-		if (match_any_variant(write_location, write_eeprom_variants, 4))
+		int write_eeprom_match = try_eeprom ? match_any_variant(write_location, write_eeprom_variants, 5) : -1;
+		if (write_eeprom_match >= 0)
 		{
             found_write_location = 1;
-            printf("ProgramEepromDword identified at offset %lx, patching\n", write_location - rom);
+            printf(gbata_converted
+                ? "SRAM-patched ProgramEepromDword identified at offset %lx, patching\n"
+                : "ProgramEepromDword identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_EEPROM_PATCHED[(uint32_t*) payload_bin];
 		}
-        if (match_any_variant(write_location, read_eeprom_variants, 2))
+        int read_eeprom_match = try_eeprom ? match_any_variant(write_location, read_eeprom_variants, 3) : -1;
+        if (read_eeprom_match >= 0)
 		{
             found_write_location = 1;
-            printf("ReadEepromDword identified at offset %lx, patching\n", write_location - rom);
+            printf(gbata_converted
+                ? "SRAM-patched ReadEepromDword identified at offset %lx, patching\n"
+                : "ReadEepromDword identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + READ_EEPROM_PATCHED[(uint32_t*) payload_bin];
 		}
-        if (!memcmp(write_location, verify_eeprom_signature, sizeof verify_eeprom_signature))
+        if (try_eeprom && !memcmp(write_location, verify_eeprom_signature, sizeof verify_eeprom_signature))
 		{
             found_write_location = 1;
-            printf("VerifyEepromDword identified at offset %lx, patching\n", write_location - rom);
+            printf(gbata_converted
+                ? "SRAM-patched VerifyEepromDword identified at offset %lx, patching\n"
+                : "VerifyEepromDword identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_EEPROM_PATCHED[(uint32_t*) payload_bin];
 		}
-        if (match_any_variant(write_location, identify_eeprom_variants, 2))
+        if (try_eeprom && match_any_variant(write_location, identify_eeprom_variants, 3) >= 0)
         {
             found_write_location = 1;
             uint32_t meta_ptr = resolve_eeprom_meta_ptr(rom, write_location - rom);
             EEPROM_META[(uint32_t*) &rom[payload_base]] = meta_ptr;
-            printf("IdentifyEeprom identified at offset %lx, RAM address of eeprom info is %x\n", write_location - rom, meta_ptr);
+            printf(gbata_converted
+                ? "SRAM-patched IdentifyEeprom identified at offset %lx, RAM address of eeprom info is %x\n"
+                : "IdentifyEeprom identified at offset %lx, RAM address of eeprom info is %x\n", write_location - rom, meta_ptr);
         }
 	}
     if (!found_write_location)
