@@ -7,6 +7,9 @@ asm(R"(.section .text
 .word read_eeprom_patched + 1
 .word verify_sram_patched + 1
 .word verify_eeprom_patched + 1
+.word write_eeprom_fixed6_patched + 1
+.word read_eeprom_fixed6_patched + 1
+.word verify_eeprom_fixed6_patched + 1
 eeprom_meta:
 .word 0)");
 
@@ -248,4 +251,46 @@ unsigned verify_eeprom_patched(unsigned short addr, unsigned char *src)
         return 1;
     int loadfactor_log2 = eeprom_meta->addrs == 0x40 ? 7 : 3;
     return verify_core_patched(src, addr << 3, 1 << 3, loadfactor_log2) >= 0;
+}
+
+/*
+ * --- Varianti a indirizzamento FISSO a 6 bit (Rayman Advance) ---
+ *
+ * Alcuni giochi non hanno una routine "IdentifyEeprom" che rilevi a
+ * runtime la dimensione dell'EEPROM: costruiscono la sequenza di comandi
+ * bit per bit direttamente dentro read/write, con un indirizzamento a 6
+ * bit deciso in fase di compilazione. Lo si riconosce sia dal controllo
+ * "indirizzo <= 63" all'inizio della funzione, sia dai conteggi dei
+ * trasferimenti DMA verso 0x0D000000: 9 bit di richiesta + 68 bit di
+ * risposta per la lettura, 73 bit in un'unica trasmissione per la
+ * scrittura (2 comando + 6 indirizzo + 64 dati + 1 stop).
+ *
+ * 6 bit di indirizzo = 64 blocchi da 8 byte = 512 byte = EEPROM da
+ * 4Kbit. Usiamo quindi loadfactor_log2 = 7, lo stesso valore che il
+ * percorso normale sceglie quando eeprom_meta->addrs == 0x40 (cioe'
+ * proprio il caso 64 blocchi). Con 7 i 512 byte logici si distribuiscono
+ * sull'intero spazio Flash da 64KB: ogni settore da 4KB ne contiene 32,
+ * quindi una scrittura da 8 byte ne riprogramma 32 anziche' 512, e
+ * l'usura si distribuisce su 16 settori invece di concentrarsi su uno.
+ */
+#define EEPROM_FIXED6_LOADFACTOR_LOG2 7
+
+unsigned write_eeprom_fixed6_patched(unsigned short addr, unsigned char *src)
+{
+    write_core_patched(src, addr << 3, 1 << 3, EEPROM_FIXED6_LOADFACTOR_LOG2);
+    return 0;
+}
+unsigned read_eeprom_fixed6_patched(unsigned short addr, unsigned char *dst)
+{
+    read_core_patched(dst, addr << 3, 1 << 3, EEPROM_FIXED6_LOADFACTOR_LOG2);
+    return 0;
+}
+unsigned verify_eeprom_fixed6_patched(unsigned short addr, unsigned char *src)
+{
+    /* Convenzione di ritorno ricavata dal disassemblato della routine
+     * originale: uno slot inizializzato a 0, sovrascritto con
+     * 0x80 << 8 = 0x8000 solo se il confronto trova una discrepanza.
+     * Quindi 0 = tutto combacia, 0x8000 = mismatch. */
+    return verify_core_patched(src, addr << 3, 1 << 3,
+                               EEPROM_FIXED6_LOADFACTOR_LOG2) < 0 ? 0 : 0x8000;
 }
