@@ -1,4 +1,3 @@
-
 asm(R"(.section .text
 
 .word write_sram_patched + 1
@@ -152,12 +151,52 @@ void write_core_patched(unsigned char *src, unsigned idx, unsigned size, int loa
             len -= prefix;      
         }
         
-        my_memcpy(sector_buf, 1, sector, 1 << loadfactor_log2, sector_usage);
-        if (my_memcpy(sector_buf + prefix, 1, src, 1, len))
+        /* La Flash puo' portare i bit da 1 a 0 programmando direttamente:
+         * solo il passaggio inverso (0 -> 1) richiede di cancellare
+         * l'intero settore. Se i byte nuovi non richiedono di riportare
+         * a 1 nessun bit, programmiamo quindi soltanto i byte che
+         * cambiano, senza erase e senza riscrivere tutto il settore.
+         *
+         * Non e' un'ottimizzazione cosmetica. J-League Pocket, quando
+         * non trova un salvataggio valido, azzera i 32KB di SRAM in
+         * blocchi da 16 byte: con un erase + riscrittura completa del
+         * settore per ogni blocco servirebbero milioni di operazioni, e
+         * il gioco sembrava bloccato all'avvio. Su Flash vergine (tutta
+         * 0xFF) questo percorso evita l'erase del tutto, perche' da
+         * 0xFF si puo' scrivere qualsiasi valore.
+         *
+         * Per decidere leggiamo dalla Flash solo i byte effettivamente
+         * interessati, non tutto il settore: l'intero settore serve
+         * soltanto nel ramo con erase, dove va salvato e riscritto.
+         * Cosi' anche il buffer di appoggio in EWRAM viene toccato solo
+         * quando serve davvero. */
+        int changed = 0;
+        int need_erase = 0;
+        for (int i = 0; i < len; ++i)
         {
+            unsigned char oldb = sector[(prefix + i) << loadfactor_log2];
+            unsigned char newb = src[i];
+            if (oldb != newb)
+            {
+                changed = 1;
+                if ((unsigned char) (oldb & newb) != newb)
+                    need_erase = 1;
+            }
+        }
+
+        if (changed && need_erase)
+        {
+            my_memcpy(sector_buf, 1, sector, 1 << loadfactor_log2, sector_usage);
+            my_memcpy(sector_buf + prefix, 1, src, 1, len);
             flashEraseSector(sector);
             for (int i = 0; i < sector_usage; ++i)
-                flashProgramByte(&sector[i << loadfactor_log2], sector_buf[i]);        
+                flashProgramByte(&sector[i << loadfactor_log2], sector_buf[i]);
+        }
+        else if (changed)
+        {
+            for (int i = 0; i < len; ++i)
+                if (sector[(prefix + i) << loadfactor_log2] != src[i])
+                    flashProgramByte(&sector[(prefix + i) << loadfactor_log2], src[i]);
         }
         
         src += len;
@@ -205,9 +244,21 @@ void write_sram_patched(unsigned char *src, unsigned char *dst, unsigned size)
         /* src e' nell'area SRAM/Flash: lettura Flash -> RAM */
         read_core_patched(dst, 0x00007FFF & (unsigned) src, size, 1);
     }
-    /* se nessuno dei due e' nell'area SRAM/Flash, non dovrebbe mai
-     * succedere per questa funzione: non facciamo nulla piuttosto che
-     * corrompere memoria a caso */
+    else
+    {
+        /* Nessuno dei due e' nell'area SRAM/Flash: eseguiamo una copia
+         * normale, cioe' esattamente quello che faceva la funzione
+         * originale che abbiamo sostituito.
+         *
+         * Prima qui non facevamo nulla. Finora non era un problema
+         * perche' le funzioni agganciate erano dedicate al salvataggio,
+         * ma alcuni giochi (es. J-League Pocket) usano come driver SRAM
+         * una copia byte-per-byte del tutto generica: se il gioco la
+         * riusa anche per copie normali in RAM, "non fare nulla" le
+         * romperebbe in silenzio. Copiare e' sempre almeno corretto
+         * quanto il comportamento originale. */
+        my_memcpy(dst, 1, src, 1, size);
+    }
 }
 void read_sram_patched(unsigned char *src, unsigned char *dst, unsigned size)
 {
@@ -221,7 +272,42 @@ void read_sram_patched(unsigned char *src, unsigned char *dst, unsigned size)
 }
 unsigned char *verify_sram_patched(unsigned char *src, unsigned char *tgt, unsigned size)
 {
-    int error_idx = verify_core_patched(src, 0x00007FFF & (unsigned) tgt, size, 1);
+    /* Come write_sram_patched, non diamo per scontato quale dei due
+     * puntatori sia la SRAM. La convenzione classica vuole che sia il
+     * secondo (tgt), ma il driver a copia generica di alcuni giochi usa
+     * la stessa funzione in entrambi i versi: se indovinassimo male,
+     * mascheremmo un indirizzo RAM come indice SRAM e il confronto
+     * fallirebbe sempre, facendo credere al gioco che il salvataggio
+     * sia corrotto. */
+    unsigned char *ram;
+    unsigned idx;
+
+    if (((unsigned) tgt & 0xFF000000) == 0x0E000000)
+    {
+        idx = 0x00007FFF & (unsigned) tgt;
+        ram = src;
+    }
+    else if (((unsigned) src & 0xFF000000) == 0x0E000000)
+    {
+        idx = 0x00007FFF & (unsigned) src;
+        ram = tgt;
+    }
+    else
+    {
+        /* nessuno dei due e' in area SRAM: confronto normale, come
+         * faceva la funzione originale */
+        while (size)
+        {
+            if (*src != *tgt)
+                return tgt;
+            ++src;
+            ++tgt;
+            --size;
+        }
+        return 0;
+    }
+
+    int error_idx = verify_core_patched(ram, idx, size, 1);
     return error_idx < 0 ? 0 : (unsigned char *) (0x0E000000 | error_idx);
 }
 
