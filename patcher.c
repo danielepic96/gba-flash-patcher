@@ -1,4 +1,3 @@
-
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -82,6 +81,45 @@ static unsigned char write_sram_ram_signature[] = { 0x04, 0xC0, 0x90, 0xE4, 0x01
 static unsigned char read_sram_signature[] = { 0x70, 0xB5, 0xA0, 0xB0, 0x04, 0x1C, 0x0D, 0x1C, 0x16, 0x1C, 0x08, 0x4A, 0x10, 0x88, 0x08, 0x49};
 
 static unsigned char verify_sram_signature[] = { 0x70, 0xB5, 0xB0, 0xB0, 0x04, 0x1C, 0x0D, 0x1C, 0x16, 0x1C, 0x08, 0x4A, 0x10, 0x88, 0x08, 0x49 };
+
+/* --- Driver SRAM a copia generica (J-League Pocket) ---
+ * Questi giochi hanno una tabella di quattro funzioni subito dopo la
+ * stringa "SRAM_Vxxx" nell'header: copia, copia-eseguita-da-RAM,
+ * confronto, confronto-eseguito-da-RAM. Le due "fast" non impostano
+ * WAITCNT (lo fa il wrapper), quindi non assomigliano a nessuna delle
+ * firme SRAM classiche e sfuggivano completamente al patcher.
+ *
+ * I due wrapper copiano la routine interna sullo stack e la eseguono
+ * da li' (trampolino "bx r3"): agganciandoli, la copia non avviene
+ * proprio, quindi il problema si risolve alla radice.
+ *
+ * ATTENZIONE: copia e confronto hanno prologhi che differiscono di UN
+ * SOLO byte (la lista di registri nel push). Per questo le due firme
+ * "fast" sono lunghe 40 byte: arrivano fino al corpo del ciclo, dove
+ * la distinzione e' esplicita (strb = copia, ldrb+cmp = confronto) e
+ * non affidata a un singolo byte. */
+static unsigned char sram_gencopy_sig[] = {
+    0x80, 0xB5, 0x83, 0xB0, 0x6F, 0x46, 0x38, 0x60, 0x79, 0x60, 0xBA, 0x60, 0xB8, 0x68, 0x41, 0x1E,
+    0x08, 0x1C, 0xB8, 0x60, 0x01, 0x21, 0xC8, 0x42, 0x00, 0xD1, 0x09, 0xE0, 0x38, 0x1D, 0x01, 0x68,
+    0x3A, 0x68, 0x13, 0x78, 0x0B, 0x70, 0x01, 0x32 };
+static unsigned char sram_genverify_sig[] = {
+    0x90, 0xB5, 0x83, 0xB0, 0x6F, 0x46, 0x38, 0x60, 0x79, 0x60, 0xBA, 0x60, 0xB8, 0x68, 0x41, 0x1E,
+    0x08, 0x1C, 0xB8, 0x60, 0x01, 0x21, 0xC8, 0x42, 0x00, 0xD1, 0x0F, 0xE0, 0x38, 0x1D, 0x01, 0x68,
+    0x3C, 0x68, 0x0A, 0x78, 0x23, 0x78, 0x01, 0x34 };
+
+/* Wrapper che copiano la routine in RAM. I byte 12, 14 e 18 sono
+ * immediati di "ldr rX, [pc, #imm]" e dipendono dalla posizione: in
+ * wildcard. Il byte 2 e' la dimensione dello stack allocato ed e'
+ * l'unica cosa che distingue il wrapper di copia (0xA7) da quello di
+ * confronto (0xB7), quindi deve restare esatto - il che rende queste
+ * due firme piu' specifiche di questo gioco rispetto alle "fast". */
+static unsigned char sram_gencopy_ram_sig[] = {
+    0x90, 0xB5, 0xA7, 0xB0, 0x6F, 0x46, 0x38, 0x60, 0x79, 0x60, 0xBA, 0x60, 0x00, 0x48, 0x00, 0x49, 0x0A, 0x88, 0x00, 0x4B };
+static int         sram_gencopy_ram_wild[] = { 0,0,0,0,0,0,0,0,0,0,0,0, 1,0, 1,0, 0,0, 1,0 };
+static unsigned char sram_genverify_ram_sig[] = {
+    0x90, 0xB5, 0xB7, 0xB0, 0x6F, 0x46, 0x38, 0x60, 0x79, 0x60, 0xBA, 0x60, 0x00, 0x48, 0x00, 0x49, 0x0A, 0x88, 0x00, 0x4B };
+static int         sram_genverify_ram_wild[] = { 0,0,0,0,0,0,0,0,0,0,0,0, 1,0, 1,0, 0,0, 1,0 };
+
 
 /* Ogni "operazione" (scrittura/lettura/identificazione EEPROM) puo' avere
  * piu' varianti byte-per-byte a seconda del compilatore/versione usati dal
@@ -360,11 +398,22 @@ int main(int argc, char **argv)
      * originale invariato (ancora "EEPROM_V...", solo con un marcatore
      * "(Patched)"): non aggiunge una vera stringa SRAM_V. Quindi la sola
      * presenza di EEPROM_V non basta per escludere la scansione SRAM,
-     * altrimenti romperemmo proprio questo caso d'uso legittimo. Saltiamo
-     * la scansione SRAM solo quando troviamo ENTRAMBE le stringhe native
-     * insieme (il caso ambiguo visto su Rocky, dove SRAM_V e' una vera
-     * stringa nativa, non un residuo di conversione). */
+     * altrimenti romperemmo proprio questo caso d'uso legittimo. */
     int try_eeprom = has_eeprom_id || !has_sram_id;
+
+    /* Se l'header dichiara SIA EEPROM SIA SRAM, il salvataggio vero e'
+     * l'EEPROM e la scansione SRAM va saltata del tutto.
+     *
+     * Verificato su Rocky (E): senza questa regola il gioco aggancia
+     * anche il lato SRAM, e il suo auto-test di avvio - che scrive 10
+     * byte e li rilegge - RIESCE invece di fallire come farebbe su una
+     * cartuccia EEPROM originale, mandando il gioco in un loop infinito.
+     * Il sintomo e' caratteristico: il primo avvio funziona (Flash
+     * vergine, il test fallisce correttamente), il blocco arriva dal
+     * SECONDO avvio in poi, quando il pattern di test e' ormai scritto.
+     *
+     * Non e' un problema di prestazioni e non e' risolvibile altrove:
+     * l'unico modo e' non toccare affatto la SRAM in questi giochi. */
     int try_sram = !(has_eeprom_id && has_sram_id);
     if (has_eeprom_id && has_sram_id)
         puts("Header declares both EEPROM and SRAM - assuming EEPROM is the real save type and skipping SRAM signature scan");
@@ -466,6 +515,34 @@ int main(int argc, char **argv)
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + READ_EEPROM_PATCHED[(uint32_t*) payload_bin];
 		}
+        if (try_sram && !memcmp(write_location, sram_gencopy_sig, sizeof sram_gencopy_sig))
+        {
+            found_write_location = 1;
+            printf("WriteSram (generic copy driver) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_sram && !memcmp_wild(write_location, sram_gencopy_ram_sig, sram_gencopy_ram_wild, sizeof sram_gencopy_ram_sig))
+        {
+            found_write_location = 1;
+            printf("WriteSram (generic copy driver, RAM-executed) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_sram && !memcmp(write_location, sram_genverify_sig, sizeof sram_genverify_sig))
+        {
+            found_write_location = 1;
+            printf("VerifySram (generic copy driver) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_sram && !memcmp_wild(write_location, sram_genverify_ram_sig, sram_genverify_ram_wild, sizeof sram_genverify_ram_sig))
+        {
+            found_write_location = 1;
+            printf("VerifySram (generic copy driver, RAM-executed) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
         if (try_eeprom && match_any_variant(write_location, read_eeprom_fixed6_variants, 1) >= 0)
         {
             found_write_location = 1;
