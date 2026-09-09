@@ -18,6 +18,9 @@ enum payload_offsets {
     READ_EEPROM_PATCHED,
     VERIFY_SRAM_PATCHED,
     VERIFY_EEPROM_PATCHED,
+    WRITE_EEPROM_FIXED6_PATCHED,
+    READ_EEPROM_FIXED6_PATCHED,
+    VERIFY_EEPROM_FIXED6_PATCHED,
     EEPROM_META
 };
 
@@ -157,6 +160,42 @@ static const sig_variant read_eeprom_variants[] = {
 };
 
 static unsigned char verify_eeprom_signature[] = { 0x30, 0xB5, 0x82, 0xB0, 0x0C, 0x1C, 0x00, 0x04, 0x01, 0x0C, 0x00, 0x25, 0x03, 0x48, 0x00, 0x68 };
+
+/* --- Varianti a indirizzamento FISSO a 6 bit (Rayman Advance) ---
+ * Questi giochi non hanno una IdentifyEeprom: l'indirizzamento a 6 bit e'
+ * deciso in compilazione, quindi vanno instradati a funzioni del payload
+ * che non passano da get_eeprom_meta(). Array separati dagli altri perche'
+ * puntano a offset diversi nel payload.
+ *
+ * ATTENZIONE: lettura e scrittura hanno prologhi quasi identici (l'unica
+ * differenza e' il primo byte, cioe' la lista di registri nel push), ed e'
+ * facilissimo scambiarle. Il ruolo NON e' stato dedotto dal prologo ma dai
+ * conteggi dei trasferimenti DMA verso 0x0D000000:
+ *   0x48634 -> dma(buf -> EEPROM, 9) poi dma(EEPROM -> buf, 68)  = LETTURA
+ *   0x48788 -> dma(buf -> EEPROM, 73) in un'unica trasmissione   = SCRITTURA
+ * (9 = 2 comando + 6 indirizzo + 1 stop; 68 = 4 ignorati + 64 dati;
+ *  73 = 2 comando + 6 indirizzo + 64 dati + 1 stop). */
+static unsigned char read_eeprom_fixed6_sig_a[] = { 0xB0, 0xB5, 0xAA, 0xB0, 0x6F, 0x46, 0x79, 0x60, 0x39, 0x1C, 0x08, 0x80, 0x38, 0x1C, 0x01, 0x88, 0x3F, 0x29, 0x00, 0xD9, 0x00, 0x48 };
+/* Indici 18 e 20 in wildcard: sono l'offset di un salto condizionale e
+ * l'immediato di una "ldr r0,[pc,#imm]", entrambi dipendenti da dove
+ * cade la funzione nel codice compilato. In Rayman valgono 0x03 e 0x00,
+ * ma un altro gioco con lo stesso compilatore potrebbe avere un layout
+ * di literal pool leggermente diverso. */
+static int         read_eeprom_fixed6_sig_a_wild[] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1,0, 1,0 };
+static const sig_variant read_eeprom_fixed6_variants[] = {
+    { read_eeprom_fixed6_sig_a, read_eeprom_fixed6_sig_a_wild, sizeof read_eeprom_fixed6_sig_a },
+};
+static unsigned char write_eeprom_fixed6_sig_a[] = { 0x80, 0xB5, 0xAA, 0xB0, 0x6F, 0x46, 0x79, 0x60, 0x39, 0x1C, 0x08, 0x80, 0x38, 0x1C, 0x01, 0x88, 0x3F, 0x29, 0x00, 0xD9, 0x00, 0x48 };
+static int         write_eeprom_fixed6_sig_a_wild[] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1,0, 1,0 };
+static const sig_variant write_eeprom_fixed6_variants[] = {
+    { write_eeprom_fixed6_sig_a, write_eeprom_fixed6_sig_a_wild, sizeof write_eeprom_fixed6_sig_a },
+};
+/* La verifica rilegge tramite la funzione di lettura sopra e confronta;
+ * restituisce 0 se combacia, 0x8000 in caso di discrepanza. */
+static unsigned char verify_eeprom_fixed6_sig_a[] = { 0xB0, 0xB5, 0x87, 0xB0, 0x6F, 0x46, 0x79, 0x60, 0x39, 0x1C, 0x08, 0x80, 0x38, 0x1C, 0x18, 0x30, 0x00, 0x21, 0x01, 0x80, 0x38, 0x1C };
+static const sig_variant verify_eeprom_fixed6_variants[] = {
+    { verify_eeprom_fixed6_sig_a, NULL, sizeof verify_eeprom_fixed6_sig_a },
+};
 
 /* --- IdentifyEeprom --- */
 static unsigned char identify_eeprom_sig_a[] = { 0x00, 0x04, 0x00, 0x0C, 0x00, 0x22, 0x04, 0x28, 0x08, 0xD1, 0x02, 0x49, 0x02, 0x48, 0x08, 0x60 };
@@ -426,6 +465,27 @@ int main(int argc, char **argv)
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + READ_EEPROM_PATCHED[(uint32_t*) payload_bin];
 		}
+        if (try_eeprom && match_any_variant(write_location, read_eeprom_fixed6_variants, 1) >= 0)
+        {
+            found_write_location = 1;
+            printf("ReadEepromDword (fixed 6-bit addressing) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + READ_EEPROM_FIXED6_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_eeprom && match_any_variant(write_location, write_eeprom_fixed6_variants, 1) >= 0)
+        {
+            found_write_location = 1;
+            printf("ProgramEepromDword (fixed 6-bit addressing) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_EEPROM_FIXED6_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_eeprom && match_any_variant(write_location, verify_eeprom_fixed6_variants, 1) >= 0)
+        {
+            found_write_location = 1;
+            printf("VerifyEepromDword (fixed 6-bit addressing) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_EEPROM_FIXED6_PATCHED[(uint32_t*) payload_bin];
+        }
         if (try_eeprom && !memcmp(write_location, verify_eeprom_signature, sizeof verify_eeprom_signature))
 		{
             found_write_location = 1;
