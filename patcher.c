@@ -28,29 +28,48 @@ enum payload_offsets {
 static unsigned char thumb_branch_thunk[] = { 0x00, 0x4b, 0x18, 0x47 };
 static unsigned char arm_branch_thunk[] = { 0x00, 0x30, 0x9f, 0xe5, 0x13, 0xff, 0x2f, 0xe1 };
 
-static unsigned char write_sram_signature[] = { 0x30, 0xB5, 0x05, 0x1C, 0x0C, 0x1C, 0x13, 0x1C, 0x0B, 0x4A, 0x10, 0x88, 0x0B, 0x49, 0x08, 0x40};
-/* I byte agli indici 8 e 12 sono l'immediato di due "ldr rX, [pc, #imm]"
- * che caricano il registro WAITCNT e la sua maschera da una literal pool
- * adiacente. Quella distanza cambia leggermente a seconda della posizione
- * di ciascuna copia della funzione nel codice compilato, quindi il valore
- * esatto di questi due byte NON e' affidabile per identificare la
- * funzione: li trattiamo come wildcard (1 = ignora). Trovato analizzando
- * manualmente il gioco: la stessa funzione generica di copia compare 3
- * volte nella ROM con offset di literal pool leggermente diversi, e il
- * confronto byte-per-byte originale ne intercettava solo 2 su 3. */
-static int write_sram_signature_wild[] = { 0,0,0,0,0,0,0,0, 1,0,0,0, 1,0,0,0 };
+/* --- Funzione generica di copia SRAM: due firme, una per ruolo ---
+ *
+ * Scrittura e verifica condividono lo stesso prologo (impostazione di
+ * WAITCNT) e differiscono solo nel corpo del ciclo: ldrb+strb per la
+ * copia, ldrb+ldrb+cmp per il confronto. In precedenza qui c'era UNA
+ * firma corta di 16 byte piu' un controllo separato dei byte 34-37 per
+ * decidere il ruolo.
+ *
+ * Quel meccanismo curava il sintomo sbagliato. Le wildcard agli indici
+ * 8 e 12 erano state introdotte credendo che l'immediato della literal
+ * pool variasse con la posizione della funzione; in realta' varia tra i
+ * DUE RUOLI (0x0B nella scrittura, 0x0A nella verifica), perche' i due
+ * corpi hanno lunghezza diversa e quindi la literal pool cade a distanza
+ * diversa. Verificato su 23 occorrenze reali: dentro ciascun ruolo non
+ * varia nulla nei primi 40 byte.
+ *
+ * Con due firme complete il ruolo e' determinato dalla firma stessa,
+ * senza controlli a distanza fissa, e sparisce il caso "corpo non
+ * riconosciuto" in cui prima non si agganciava nulla.
+ *
+ * Le wildcard su 8 e 12 restano comunque: sono immediati di literal
+ * pool e in linea di principio dipendono dalla posizione. Che siano
+ * costanti nel nostro campione puo' essere fortuna di compilazioni
+ * identiche, e tenerle non costa nulla dato che il ruolo e' ormai
+ * garantito dal corpo incluso nella firma. */
+static unsigned char write_sram_generic_sig[] = {
+    0x30, 0xB5, 0x05, 0x1C, 0x0C, 0x1C, 0x13, 0x1C, 0x0B, 0x4A, 0x10, 0x88, 0x0B, 0x49, 0x08, 0x40,
+    0x03, 0x21, 0x08, 0x43, 0x10, 0x80, 0x01, 0x3B, 0x01, 0x20, 0x40, 0x42, 0x83, 0x42, 0x07, 0xD0,
+    0x01, 0x1C, 0x28, 0x78, 0x20, 0x70, 0x01, 0x35 };
+static int write_sram_generic_wild[] = {
+    0,0,0,0,0,0,0,0, 1,0,0,0, 1,0,0,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0,0,0,0,0 };
 
-/* Byte 34-37 (relativi all'inizio della funzione, quindi oltre le 16
- * della firma sopra) distinguono in modo affidabile la variante
- * "scrittura" (copia: ldrb+strb) dalla variante "verifica" (confronto:
- * ldrb+ldrb+cmp), che condividono lo stesso prologo di impostazione
- * WAITCNT ma hanno un corpo del ciclo diverso. A differenza dei byte 8
- * e 12, questi non dipendono dalla posizione della literal pool: sono
- * istruzioni che usano solo registri, quindi la loro codifica resta
- * identica ovunque si trovi la funzione nella ROM. */
-static unsigned char write_body_pattern[] = { 0x28, 0x78, 0x20, 0x70 };
-static unsigned char verify_body_pattern[] = { 0x21, 0x78, 0x28, 0x78 };
-#define SRAM_BODY_PATTERN_OFFSET 34
+static unsigned char verify_sram_generic_sig[] = {
+    0x30, 0xB5, 0x05, 0x1C, 0x0C, 0x1C, 0x13, 0x1C, 0x0A, 0x4A, 0x10, 0x88, 0x0A, 0x49, 0x08, 0x40,
+    0x03, 0x21, 0x08, 0x43, 0x10, 0x80, 0x01, 0x3B, 0x01, 0x20, 0x40, 0x42, 0x83, 0x42, 0x10, 0xD0,
+    0x02, 0x1C, 0x21, 0x78, 0x28, 0x78, 0x01, 0x35 };
+static int verify_sram_generic_wild[] = {
+    0,0,0,0,0,0,0,0, 1,0,0,0, 1,0,0,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0,0,0,0,0 };
 
 static int memcmp_wild(const uint8_t *data, const unsigned char *sig, const int *wild, size_t len)
 {
@@ -81,6 +100,106 @@ static unsigned char write_sram_ram_signature[] = { 0x04, 0xC0, 0x90, 0xE4, 0x01
 static unsigned char read_sram_signature[] = { 0x70, 0xB5, 0xA0, 0xB0, 0x04, 0x1C, 0x0D, 0x1C, 0x16, 0x1C, 0x08, 0x4A, 0x10, 0x88, 0x08, 0x49};
 
 static unsigned char verify_sram_signature[] = { 0x70, 0xB5, 0xB0, 0xB0, 0x04, 0x1C, 0x0D, 0x1C, 0x16, 0x1C, 0x08, 0x4A, 0x10, 0x88, 0x08, 0x49 };
+
+/* --- VerifySram, variante "push {r4,r7,lr}" (Tanbi Musou - Meine Liebe) ---
+ * Il prologo e' identico a write_sram2_signature TRANNE il primo byte:
+ * 0x90 (push {r4,r7,lr}) invece di 0x80 (push {r7,lr}). Non e' una
+ * coincidenza - il ciclo di confronto ha bisogno di un registro in piu'
+ * per il secondo puntatore - ma un solo byte e' un appiglio troppo
+ * fragile, quindi la firma arriva fino al corpo del ciclo, dove il ruolo
+ * e' esplicito: due ldrb seguiti da cmp (confronto) invece di ldrb + strb
+ * (copia). La literal pool interna contiene solo costanti (WAITCNT e la
+ * sua maschera), quindi non serve nessuna wildcard.
+ * Convenzione di ritorno: 0 se tutto combacia, altrimenti l'indirizzo del
+ * byte diverso - la stessa che verify_sram_patched gia' produce. */
+static unsigned char verify_sram_push4_sig[] = {
+    0x90, 0xB5, 0x83, 0xB0, 0x6F, 0x46, 0x38, 0x60, 0x79, 0x60, 0xBA, 0x60, 0x09, 0x48, 0x09, 0x49,
+    0x0A, 0x88, 0x09, 0x4B, 0x11, 0x1C, 0x19, 0x40, 0x0A, 0x1C, 0x03, 0x23, 0x11, 0x1C, 0x19, 0x43,
+    0x0A, 0x1C, 0x02, 0x80, 0xB8, 0x68, 0x41, 0x1E, 0x08, 0x1C, 0xB8, 0x60, 0x01, 0x21, 0xC8, 0x42,
+    0x04, 0xD1, 0x13, 0xE0, 0x04, 0x02, 0x00, 0x04, 0xFC, 0xFF, 0x00, 0x00, 0x38, 0x1D, 0x01, 0x68,
+    0x3C, 0x68, 0x0A, 0x78, 0x23, 0x78, 0x01, 0x34, 0x3C, 0x60, 0x01, 0x31, 0x01, 0x60, 0x9A, 0x42,
+    0x03, 0xD0 };
+
+/* --- Driver SRAM copiato in RAM (Motoracer Advance) ---
+ * Il gioco tiene in ROM tre blocchi consecutivi (due copie identiche e un
+ * confronto) e li ricopia in RAM per eseguirli da li'. Nessuna ricerca
+ * statica lo trovava, per due motivi che si sommavano: l'indirizzo SRAM
+ * arriva come parametro, quindi non compare come costante dentro la
+ * routine, e WAITCNT viene impostato con base 0x04000200 + offset 4
+ * anziche' con la costante 0x04000204. E' saltato fuori solo col
+ * debugger, mettendo un watchpoint su 0x0E000000.
+ *
+ * Agganciare la copia in ROM basta: il thunk viene ricopiato in RAM
+ * insieme al resto e li' funziona lo stesso, perche' tutte e tre le
+ * destinazioni RAM sono allineate a 4 byte (la "ldr r3,[pc,#0]" del
+ * thunk legge il proprio letterale, anch'esso copiato).
+ *
+ * Come sempre, i ruoli NON sono dedotti dal prologo (identico per tutte
+ * e tre) ma dal corpo del ciclo: ldrb+strb = copia, ldrb+ldrb+cmp =
+ * confronto. */
+static unsigned char sram_ramexec_copy_sig[] = {
+    0x90, 0xB4, 0x0A, 0x4F, 0x0A, 0x4B, 0xBC, 0x88, 0x1C, 0x40, 0x03, 0x23, 0x23, 0x43, 0xBB, 0x80,
+    0x53, 0x1E, 0x00, 0x2A, 0x07, 0xD0, 0x02, 0x78, 0x01, 0x30, 0x0A, 0x70, 0x1A, 0x1C, 0x01, 0x3B,
+    0x01, 0x31, 0x00, 0x2A };
+/* Ritorna 0 se tutto combacia, altrimenti l'indirizzo del byte diverso:
+ * la stessa convenzione che verify_sram_patched gia' produce. */
+static unsigned char sram_ramexec_verify_sig[] = {
+    0x90, 0xB4, 0x0C, 0x4F, 0x0C, 0x4B, 0xBC, 0x88, 0x1C, 0x40, 0x03, 0x23, 0x23, 0x43, 0xBB, 0x80,
+    0x53, 0x1E, 0x00, 0x2A, 0x0C, 0xD0, 0x0F, 0x78, 0x02, 0x78, 0x01, 0x30, 0x01, 0x31, 0x97, 0x42,
+    0x02, 0xD0, 0x48, 0x1E, 0x90, 0xBC, 0x70, 0x47 };
+
+/* --- WriteSram, variante con push esteso (Rhythm Tengoku) ---
+ * Stessa sostanza delle copie SRAM classiche - imposta WAITCNT con la
+ * maschera 0xFFFC e poi copia byte per byte - ma salva quattro registri
+ * invece di due nel prologo (push {r4,r5,r6,r7,lr} anziche'
+ * push {r4,r5,lr}), il che bastava a renderla invisibile a tutte le
+ * firme esistenti. Era la seconda voce della tabella dei driver, con le
+ * altre due gia' agganciate.
+ * La firma arriva fino al corpo del ciclo (ldrb + strb) cosi' il ruolo
+ * di copia e' provato dal comportamento, non dedotto dal prologo. La
+ * literal pool interna contiene solo costanti (WAITCNT e la sua
+ * maschera), quindi non serve nessuna wildcard. */
+static unsigned char write_sram_push4reg_sig[] = {
+    0xF0, 0xB5, 0x04, 0x1C, 0x0E, 0x1C, 0x15, 0x1C, 0x03, 0x4A, 0x10, 0x88, 0x03, 0x49, 0x08, 0x40,
+    0x03, 0x21, 0x08, 0x43, 0x10, 0x80, 0x0A, 0xE0, 0x04, 0x02, 0x00, 0x04, 0xFC, 0xFF, 0x00, 0x00,
+    0x20, 0x78, 0x30, 0x70, 0x01, 0x34, 0x01, 0x36, 0x01, 0x3D, 0x00, 0x2D };
+
+/* --- WriteSram, variante autonoma senza WAITCNT proprio ---
+ * (prima voce di tabella in Yu-Gi-Oh Double Pack, Top Gun, Rockman EXE
+ * 4.5, One Piece, 4 Games on One Game Pak; presente anche in Rocky, dove
+ * pero' la regola dell'header salta comunque tutta la SRAM)
+ *
+ * E' la controparte di verify_sram_standalone_sig: stessa famiglia, non
+ * imposta WAITCNT per conto proprio, nessuna literal pool e quindi
+ * nessun byte dipendente dalla posizione. Come tutte le funzioni di
+ * copia, gestisce entrambe le direzioni: il payload riconosce a runtime
+ * quale dei due puntatori cade nell'area SRAM.
+ *
+ * Era sfuggita a tutte le firme precedenti: in Yu-Gi-Oh e' la PRIMA voce
+ * della tabella dei driver, raggiunta solo tramite quel puntatore e con
+ * zero chiamate 'bl' - il tipo di funzione che sembra morta se si guarda
+ * un solo indizio invece di entrambi. */
+static unsigned char write_sram_standalone_sig[] = {
+    0x10, 0xB5, 0x04, 0x1C, 0x53, 0x1E, 0x00, 0x2A, 0x08, 0xD0, 0x01, 0x22, 0x52, 0x42, 0x20, 0x78,
+    0x08, 0x70, 0x01, 0x34, 0x01, 0x31, 0x01, 0x3B, 0x93, 0x42, 0xF8, 0xD1, 0x10, 0xBC };
+
+/* --- VerifySram, variante autonoma senza WAITCNT proprio ---
+ * (Top Gun: Combat Zones, Rockman EXE 4.5, One Piece: Mezase King of
+ * Belly, 4 Games on One Game Pak, e presente ma mai riconosciuta anche
+ * in Rocky e Yu-Gi-Oh)
+ *
+ * A differenza di tutte le altre varianti SRAM viste finora, questa non
+ * imposta WAITCNT per conto proprio (lo fa il chiamante prima); il corpo
+ * e' un confronto byte-per-byte autonomo, senza nessuna literal pool -
+ * nessun byte dipende dalla posizione, quindi nessuna wildcard serve.
+ * Trovata analizzando i "siti driver SRAM non coperti" segnalati da
+ * scanner.c: e' la riprova che quel controllo funziona anche su ROM che
+ * risultavano gia' "ok" con le firme esistenti.
+ * Convenzione di ritorno: 0 se tutto combacia, altrimenti l'indirizzo
+ * del byte diverso - la stessa di verify_sram_patched. */
+static unsigned char verify_sram_standalone_sig[] = {
+    0x30, 0xB5, 0x05, 0x1C, 0x0B, 0x1C, 0x54, 0x1E, 0x00, 0x2A, 0x0C, 0xD0, 0x01, 0x22, 0x52, 0x42,
+    0x19, 0x78, 0x28, 0x78, 0x01, 0x35, 0x01, 0x33, 0x81, 0x42, 0x01, 0xD0, 0x58, 0x1E };
 
 /* --- Driver SRAM a copia generica (J-League Pocket) ---
  * Questi giochi hanno una tabella di quattro funzioni subito dopo la
@@ -363,7 +482,7 @@ int main(int argc, char **argv)
 		puts("ROM too small to install payload.");
 		if (romsize + payload_bin_len > 0x2000000)
 		{
-			puts("ROM alraedy max size. Cannot expand. Cannot install payload");
+			puts("ROM already max size. Cannot expand. Cannot install payload");
             scanf("%*s");
 			return 1;
 		}
@@ -394,6 +513,9 @@ int main(int argc, char **argv)
      * prima (rete di sicurezza per ROM senza header pulito). */
     int has_eeprom_id = rom_contains(rom, romsize, "EEPROM_V");
     int has_sram_id = rom_contains(rom, romsize, "SRAM_V") || rom_contains(rom, romsize, "SRAM_F_V");
+    int has_flash_id = rom_contains(rom, romsize, "FLASH_V")
+                     || rom_contains(rom, romsize, "FLASH512_V")
+                     || rom_contains(rom, romsize, "FLASH1M_V");
     /* GBATA, quando converte un gioco da EEPROM a SRAM, lascia l'header
      * originale invariato (ancora "EEPROM_V...", solo con un marcatore
      * "(Patched)"): non aggiunge una vera stringa SRAM_V. Quindi la sola
@@ -413,10 +535,26 @@ int main(int argc, char **argv)
      * SECONDO avvio in poi, quando il pattern di test e' ormai scritto.
      *
      * Non e' un problema di prestazioni e non e' risolvibile altrove:
-     * l'unico modo e' non toccare affatto la SRAM in questi giochi. */
-    int try_sram = !(has_eeprom_id && has_sram_id);
+     * l'unico modo e' non toccare affatto la SRAM in questi giochi.
+     *
+     * La stessa identica situazione si presenta con FLASH+SRAM insieme
+     * (Top Gun: Combat Zones, Rockman EXE 4.5, From TV Animation One
+     * Piece: Mezase King of Belly dichiarano entrambi): un driver Flash
+     * nativo completo (sequenza di sblocco AA/55/80/AA/55/30) convive
+     * con un driver SRAM, con selezione a runtime dell'hardware
+     * collegato - la stessa architettura di Rocky, solo con Flash al
+     * posto dell'EEPROM. Non abbiamo la controprova diretta che queste
+     * tre ROM abbiano un auto-test capace di bloccarsi come quello di
+     * Rocky, ma il rischio e' lo stesso per costruzione: se il vero
+     * hardware e' Flash, la ChisCart lo emula correttamente da sola
+     * (il driver del gioco parla gia' il protocollo giusto, senza
+     * bisogno di alcuna patch), quindi non c'e' motivo di rischiare
+     * toccando anche la SRAM. */
+    int try_sram = !((has_eeprom_id || has_flash_id) && has_sram_id);
     if (has_eeprom_id && has_sram_id)
         puts("Header declares both EEPROM and SRAM - assuming EEPROM is the real save type and skipping SRAM signature scan");
+    else if (has_flash_id && has_sram_id)
+        puts("Header declares both FLASH and SRAM - assuming FLASH is the real save type and skipping SRAM signature scan");
 
     /* Controllo preliminare su tutta la ROM: la variante 0 (sig_a) di
      * ProgramEepromDword/ReadEepromDword corrisponde esattamente al
@@ -440,30 +578,19 @@ int main(int argc, char **argv)
     for (uint8_t *write_location = rom; write_location < rom + romsize - 64; write_location += 2)
     {
         int rom_offset = write_location - rom;
-		if (try_sram && !memcmp_wild(write_location, write_sram_signature, write_sram_signature_wild, sizeof write_sram_signature))
+		if (try_sram && !memcmp_wild(write_location, write_sram_generic_sig, write_sram_generic_wild, sizeof write_sram_generic_sig))
 		{
-            int is_verify = !memcmp(write_location + SRAM_BODY_PATTERN_OFFSET, verify_body_pattern, sizeof verify_body_pattern);
-            int is_write = !memcmp(write_location + SRAM_BODY_PATTERN_OFFSET, write_body_pattern, sizeof write_body_pattern);
-
-            if (is_verify)
-            {
-                found_write_location = 1;
-                printf("VerifySram (generic variant) identified at offset %lx, patching\n", write_location - rom);
-                memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
-                1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
-            }
-            else if (is_write)
-            {
-                found_write_location = 1;
-                printf("WriteSram identified at offset %lx, patching\n", write_location - rom);
-                memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
-                1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
-            }
-            /* se non corrisponde a nessuna delle due varianti note, non
-             * tocchiamo nulla: meglio lasciare intonsa una funzione che
-             * non riconosciamo con certezza piuttosto che patcharla
-             * a caso */
-
+            found_write_location = 1;
+            printf("WriteSram identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
+		}
+		if (try_sram && !memcmp_wild(write_location, verify_sram_generic_sig, verify_sram_generic_wild, sizeof verify_sram_generic_sig))
+		{
+            found_write_location = 1;
+            printf("VerifySram (generic variant) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
 		}
         if (try_sram && !memcmp(write_location, write_sram2_signature, sizeof write_sram2_signature))
 		{
@@ -515,6 +642,48 @@ int main(int argc, char **argv)
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + READ_EEPROM_PATCHED[(uint32_t*) payload_bin];
 		}
+        if (try_sram && !memcmp(write_location, verify_sram_push4_sig, sizeof verify_sram_push4_sig))
+        {
+            found_write_location = 1;
+            printf("VerifySram (push r4 variant) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_sram && !memcmp(write_location, sram_ramexec_copy_sig, sizeof sram_ramexec_copy_sig))
+        {
+            found_write_location = 1;
+            printf("WriteSram (RAM-executed driver) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_sram && !memcmp(write_location, sram_ramexec_verify_sig, sizeof sram_ramexec_verify_sig))
+        {
+            found_write_location = 1;
+            printf("VerifySram (RAM-executed driver) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_sram && !memcmp(write_location, write_sram_push4reg_sig, sizeof write_sram_push4reg_sig))
+        {
+            found_write_location = 1;
+            printf("WriteSram (extended push variant) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_sram && !memcmp(write_location, write_sram_standalone_sig, sizeof write_sram_standalone_sig))
+        {
+            found_write_location = 1;
+            printf("WriteSram (standalone variant) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
+        if (try_sram && !memcmp(write_location, verify_sram_standalone_sig, sizeof verify_sram_standalone_sig))
+        {
+            found_write_location = 1;
+            printf("VerifySram (standalone variant) identified at offset %lx, patching\n", write_location - rom);
+            memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
+            1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
+        }
         if (try_sram && !memcmp(write_location, sram_gencopy_sig, sizeof sram_gencopy_sig))
         {
             found_write_location = 1;
@@ -585,7 +754,13 @@ int main(int argc, char **argv)
 	}
     if (!found_write_location)
     {
-        puts("Could not find a write function to hook. Are you sure the game has save functionality and has been SRAM patched with GBATA?");
+        if (has_flash_id && has_sram_id)
+            puts("Header declares Flash as the real save type, and this ROM doesn't use EEPROM.\n"
+                 "Nothing to patch: a Flash cart already supports this game natively, without\n"
+                 "any modification. If it still doesn't save on real hardware, that's a separate\n"
+                 "problem, not something this tool can fix.");
+        else
+            puts("Could not find a write function to hook. Are you sure the game has save functionality?");
         scanf("%*s");
         return 1;
     }
