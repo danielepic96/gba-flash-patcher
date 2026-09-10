@@ -670,21 +670,35 @@ int main(int argc, char **argv)
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
         }
-        if (try_sram && !memcmp(write_location, write_sram_standalone_sig, sizeof write_sram_standalone_sig))
+        /* Le quattro firme che seguono descrivono solo la FORMA di un
+         * ciclo di copia o di confronto byte: non contengono nulla di
+         * specifico della SRAM (nessun WAITCNT, nessun indirizzo), quindi
+         * combaciano anche con una memcpy o una memcmp qualsiasi. Sono
+         * affidabili solo se il gioco dichiara SRAM nell'header.
+         *
+         * Senza questo vincolo il patcher agganciava due funzioni di
+         * libreria in Pokemon Emerald, che dichiara solo FLASH1M e sulla
+         * cartuccia funziona gia' nativamente: una patch li' e' puro
+         * danno potenziale, senza alcun beneficio.
+         *
+         * Verificato su 20 ROM: ogni riscontro legittimo di queste firme
+         * avviene in un gioco con header SRAM; l'unico caso senza header
+         * SRAM era proprio il falso positivo. */
+        if (try_sram && has_sram_id && !memcmp(write_location, write_sram_standalone_sig, sizeof write_sram_standalone_sig))
         {
             found_write_location = 1;
             printf("WriteSram (standalone variant) identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
         }
-        if (try_sram && !memcmp(write_location, verify_sram_standalone_sig, sizeof verify_sram_standalone_sig))
+        if (try_sram && has_sram_id && !memcmp(write_location, verify_sram_standalone_sig, sizeof verify_sram_standalone_sig))
         {
             found_write_location = 1;
             printf("VerifySram (standalone variant) identified at offset %lx, patching\n", write_location - rom);
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + VERIFY_SRAM_PATCHED[(uint32_t*) payload_bin];
         }
-        if (try_sram && !memcmp(write_location, sram_gencopy_sig, sizeof sram_gencopy_sig))
+        if (try_sram && has_sram_id && !memcmp(write_location, sram_gencopy_sig, sizeof sram_gencopy_sig))
         {
             found_write_location = 1;
             printf("WriteSram (generic copy driver) identified at offset %lx, patching\n", write_location - rom);
@@ -698,7 +712,7 @@ int main(int argc, char **argv)
             memcpy(write_location, thumb_branch_thunk, sizeof thumb_branch_thunk);
             1[(uint32_t*) write_location] = 0x08000000 + payload_base + WRITE_SRAM_PATCHED[(uint32_t*) payload_bin];
         }
-        if (try_sram && !memcmp(write_location, sram_genverify_sig, sizeof sram_genverify_sig))
+        if (try_sram && has_sram_id && !memcmp(write_location, sram_genverify_sig, sizeof sram_genverify_sig))
         {
             found_write_location = 1;
             printf("VerifySram (generic copy driver) identified at offset %lx, patching\n", write_location - rom);
@@ -754,7 +768,13 @@ int main(int argc, char **argv)
 	}
     if (!found_write_location)
     {
-        if (has_flash_id && has_sram_id)
+        /* Un gioco che dichiara Flash non ha bisogno di patch: una
+         * flashcart lo supporta nativamente. Vale sia quando l'header
+         * dichiara Flash insieme a SRAM (Top Gun e simili) sia quando
+         * dichiara solo Flash (Pokemon Emerald): in entrambi i casi il
+         * messaggio generico "sei sicuro che il gioco salvi?" sarebbe
+         * fuorviante, perche' il gioco salva benissimo. */
+        if (has_flash_id && !has_eeprom_id)
             puts("Header declares Flash as the real save type, and this ROM doesn't use EEPROM.\n"
                  "Nothing to patch: a Flash cart already supports this game natively, without\n"
                  "any modification. If it still doesn't save on real hardware, that's a separate\n"
