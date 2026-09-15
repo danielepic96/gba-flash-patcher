@@ -32,5 +32,5 @@ Patches an EEPROM or SRAM GBA game to save on Flash 512K and 1Mbit
   ID is not recognized, the payload will fallback on AMD/JEDEC protocol.
 - **Added several new signatures**: since v1.5, the patcher covers most (if
   not all) EEPROM and SRAM signatures, if you find a game which doesn't hook
-  all save function, feel free to open an Issue ticket.
+  all save functions, feel free to open an Issue ticket.
 
