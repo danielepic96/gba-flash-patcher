@@ -23,30 +23,14 @@ Patches an EEPROM or SRAM GBA game to save on Flash 512K and 1Mbit
   to loop indefinitely retrying the save. The patcher now distinguishes the
   two variants by checking loop-body bytes and routes verify calls
   correctly.
-- **Improved erase/program timing**: added toggle-bit (DQ6) polling for
-  both sector erase and byte programming, matching the completion-detection
-  method used by official Nintendo flash drivers, for more reliable timing
-  on real Macronix hardware.
+- **Improved erase/program timing**: from v2.0 restored Data-Polling (DQ7)
+  instead of Toggle-Bit (DQ6) and added program/erase timeout based on DQ5
+  on AMD/JEDEC chips (like Macronix). Greatly optimized program/erase
+  routines on all chips (faster savings).
+- **Added support for Intel/Sharp and other chip manufacturers**: from v2.0
+  has been added support for other Flash manufacturers. If the manufacturer
+  ID is not recognized, the payload will fallback on AMD/JEDEC protocol.
+- **Added several new signatures**: since v1.5, the patcher covers most (if
+  not all) EEPROM and SRAM signatures, if you find a game which doesn't hook
+  all save function, feel free to open an Issue ticket.
 
-Tested and confirmed working on a ChisCart v1.1 (1Mbit Macronix MX29L010)
-
-## EEPROM support fixes (from v1.1)
-
-This fork also fixes EEPROM save support, which previously often required
-a two-step workaround (converting to SRAM with GBATA first, then patching
-with this tool). The patcher simply couldn't recognize the real EEPROM
-read/write/identify functions in several games — different compilers
-produce slightly different machine code for the same operation, and the
-original signatures only matched one specific form.
-
-Added a clean way to handle multiple known variants of the same function
-side by side, plus several new variants found by analyzing real games —
-most of the missing cases were on the write side. Also fixed how the
-EEPROM metadata pointer gets located, so it resolves correctly regardless
-of which variant matched.
-
-Tested and confirmed fully working (read, write, verify, identify all
-found and patched) on several different EEPROM games. If you hit a game
-where the write function still isn't found, it's most likely just another
-untested compiled variant — happened four times already, so more are
-likely out there.
