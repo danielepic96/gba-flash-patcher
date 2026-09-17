@@ -25,8 +25,8 @@ Patches an EEPROM or SRAM GBA game to save on Flash 512K and 1Mbit
   correctly.
 - **Improved erase/program timing**: from v2.0 restored Data-Polling (DQ7)
   instead of Toggle-Bit (DQ6) and added program/erase timeout based on DQ5
-  on AMD/JEDEC chips (like Macronix). Greatly optimized program/erase
-  routines on all chips (faster savings).
+  on AMD/JEDEC protocol. Greatly optimized program/erase routines on all
+  chips (faster savings).
 - **Added support for Intel/Sharp and other chip manufacturers**: from v2.0
   has been added support for other Flash manufacturers. If the manufacturer
   ID is not recognized, the payload will fallback on AMD/JEDEC protocol.
