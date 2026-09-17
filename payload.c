@@ -60,7 +60,7 @@ static int detect_flash_type(void)
     SRAM_BASE[0x0000] = 0xF0;
     __asm("nop");
 
-    if (m_id == MFR_INTEL || m_id == MFR_SHARP_A || m_id == MFR_SHARP_B || m_id == MFR_NUMONYX)
+    if (m_id == MFR_INTEL || m_id == MFR_SHARP_A || m_id == MFR_SHARP_B)
     {
         SRAM_BASE[0x0000] = 0xFF;
         __asm("nop");
