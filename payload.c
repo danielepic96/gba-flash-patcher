@@ -48,7 +48,6 @@ __attribute__((noinline)) struct eeprom_meta *get_eeprom_meta()
 #define MFR_INTEL    0x89
 #define MFR_SHARP_A  0xB0
 #define MFR_SHARP_B  0x05
-#define MFR_NUMONYX  0x20
 
 static int detect_flash_type(void)
 {
