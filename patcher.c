@@ -125,12 +125,28 @@ static int memcmp_wild(const uint8_t *data, const unsigned char *sig, const int 
     return 0;
 }
 
+/* La coda di IdentifyEeprom e' sempre questa:
+ *
+ *   +10  02 49   ldr r1,[pc,#8]   <- indirizzo della VARIABILE del gioco
+ *   +12  02 48   ldr r0,[pc,#8]   <- indirizzo della STRUTTURA di configurazione
+ *   +14  08 60   str r0,[r1]      <- variabile = &struttura
+ *
+ * Al payload serve l'indirizzo della VARIABILE, non della struttura: legge
+ * quella parola e la dereferenzia ancora una volta per arrivare alla
+ * configurazione (get_eeprom_meta fa due dereferenziazioni). Bisogna quindi
+ * risolvere il letterale della PRIMA delle due ldr, quella a +10.
+ *
+ * Con il match allineato a 4 i due letterali finiscono in parole diverse,
+ * +20 e +24, quindi partire dall'istruzione sbagliata restituisce
+ * l'indirizzo della struttura: il payload lo dereferenzia una volta di
+ * troppo, legge il campo 'size' come se fosse un puntatore e ricava
+ * loadfactor_log2 da una lettura fuori memoria. */
 static uint32_t resolve_eeprom_meta_ptr(uint8_t *rom, long rom_offset)
 {
-    uint8_t imm2 = rom[rom_offset + 12];
-    uint32_t instr2_addr = 0x08000000 + rom_offset + 12;
-    uint32_t target2 = ((instr2_addr + 4) & ~3u) + imm2 * 4;
-    uint32_t rom_target_offset = target2 - 0x08000000;
+    uint8_t imm = rom[rom_offset + 10];
+    uint32_t instr_addr = 0x08000000 + rom_offset + 10;
+    uint32_t target = ((instr_addr + 4) & ~3u) + imm * 4;
+    uint32_t rom_target_offset = target - 0x08000000;
     return *(uint32_t *) &rom[rom_target_offset];
 }
 
