@@ -343,6 +343,13 @@ int main(int argc, char **argv)
             {
                 is_all_ones = 0;
             }
+            /* Posizione gia' esclusa: guardare il resto non cambia l'esito.
+             * Senza questa uscita ogni posizione costa tutti i byte del
+             * payload, e su una ROM piena fino in fondo - Fire Emblem EUR,
+             * 32 MB, primo spazio libero 17 MB prima della fine - la
+             * ricerca passava da un istante a una ventina di secondi. */
+            if (!is_all_zeroes && !is_all_ones)
+                break;
         }
         if (is_all_zeroes || is_all_ones)
         {
