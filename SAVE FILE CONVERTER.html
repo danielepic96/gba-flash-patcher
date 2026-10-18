@@ -1,0 +1,513 @@
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>GBA Save Converter</title>
+<style>
+/* Una colonna stretta: scelta della conversione, file, esito. */
+:root {
+  --bg: #f5f4f0;
+  --surface: #ffffff;
+  --fg: #1c1b19;
+  --muted: #6a675f;
+  --line: #dedbd3;
+  --accent: #2c6b5a;
+  --accent-fg: #ffffff;
+  --warn: #8a5a00;
+  --warn-bg: #fbf1dc;
+  --err: #a2312b;
+  --err-bg: #fbe7e5;
+  --drop: #edf3f0;
+  --code-bg: #efece5;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161513;
+    --surface: #1f1e1b;
+    --fg: #ece9e2;
+    --muted: #9a968b;
+    --line: #34322d;
+    --accent: #6fb39c;
+    --accent-fg: #10231e;
+    --warn: #e0b35c;
+    --warn-bg: #2e2716;
+    --err: #e58a84;
+    --err-bg: #3a201e;
+    --drop: #1b2622;
+    --code-bg: #120f1c;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161513;
+  --surface: #1f1e1b;
+  --fg: #ece9e2;
+  --muted: #9a968b;
+  --line: #34322d;
+  --accent: #6fb39c;
+  --accent-fg: #10231e;
+  --warn: #e0b35c;
+  --warn-bg: #2e2716;
+  --err: #e58a84;
+  --err-bg: #3a201e;
+  --drop: #1b2622;
+  --code-bg: #120f1c;
+  color-scheme: dark;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Source Serif 4", Georgia, "Times New Roman", serif;
+  line-height: 1.55;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 620px; margin: 0 auto; padding-block: 32px 48px; }
+.ui { font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+header h1 {
+  font-size: 1.7rem; font-weight: 600; line-height: 1.2;
+  margin: 0 0 10px; text-wrap: balance;
+}
+header p { margin: 0; color: var(--muted); font-size: 1rem; max-width: 60ch; }
+
+h2 {
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 0.78rem; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--muted);
+  margin: 0 0 10px;
+}
+section { margin-top: 32px; }
+section[hidden] { display: none; }
+
+/* Scelta della conversione */
+.choice { display: grid; gap: 8px; }
+.choice label {
+  display: flex; gap: 12px; align-items: flex-start;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 10px; padding: 12px 14px; cursor: pointer;
+}
+.choice input { margin-top: 5px; accent-color: var(--accent); }
+.choice b { display: block; font-family: "Inter", system-ui, sans-serif; font-weight: 600; font-size: 0.95rem; }
+.choice small { color: var(--muted); font-family: "Inter", system-ui, sans-serif; font-size: 0.85rem; }
+.choice label:has(input:checked) { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.choice input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* File */
+.drop {
+  display: block; text-align: center; cursor: pointer; position: relative;
+  border: 1.5px dashed var(--line); border-radius: 10px;
+  padding: 28px 16px; background: var(--surface);
+  transition: background 0.15s, border-color 0.15s;
+}
+.drop:hover, .drop.over { background: var(--drop); border-color: var(--accent); }
+.drop strong { display: block; font-weight: 600; }
+.drop span { color: var(--muted); font-size: 0.92rem; }
+.drop input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.drop:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Messaggi */
+.msg {
+  border-radius: 10px; padding: 12px 14px; margin: 0 0 10px;
+  font-family: "Inter", system-ui, sans-serif; font-size: 0.92rem;
+}
+.msg.err { background: var(--err-bg); color: var(--err); }
+.msg.warn { background: var(--warn-bg); color: var(--warn); }
+.msg:empty { display: none; }
+
+/* Rapporto e anteprima */
+.report {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 10px; padding: 4px 16px; margin: 0 0 14px;
+  font-family: "Inter", system-ui, sans-serif; font-size: 0.92rem;
+}
+.report:empty { display: none; }
+.report div {
+  display: flex; justify-content: space-between; gap: 16px;
+  padding: 10px 0; border-bottom: 1px solid var(--line);
+}
+.report div:last-child { border-bottom: 0; }
+.report dt { color: var(--muted); min-width: 0; }
+.report dd { margin: 0; font-variant-numeric: tabular-nums; text-align: right; font-weight: 500; }
+
+.hex {
+  font-family: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem; line-height: 1.6;
+  background: var(--code-bg); color: var(--muted);
+  border-radius: 8px; padding: 12px 14px; margin: 0 0 14px;
+  overflow-x: auto; white-space: pre;
+}
+.hex:empty, .hex[hidden] { display: none; }
+
+/* Nome file e download */
+.namerow {
+  display: grid; gap: 6px; margin-bottom: 14px;
+  font-family: "Inter", system-ui, sans-serif; font-size: 0.85rem; color: var(--muted);
+}
+.namerow[hidden] { display: none; }
+.namerow input {
+  font: 0.92rem ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  color: var(--fg); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px;
+  min-width: 0; width: 100%;
+}
+.namerow input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+button.go {
+  width: 100%; padding: 13px 16px;
+  font: 600 1rem "Inter", system-ui, sans-serif;
+  background: var(--accent); color: var(--accent-fg);
+  border: 0; border-radius: 10px; cursor: pointer;
+}
+button.go:disabled { opacity: 0.4; cursor: not-allowed; }
+button.go:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+footer {
+  margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--line);
+  font-family: "Inter", system-ui, sans-serif; font-size: 0.85rem; color: var(--muted);
+  line-height: 1.6;
+}
+footer b { color: var(--fg); font-weight: 600; }
+
+[hidden] { display: none !important; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>GBA Save Converter</h1>
+    <p>Converts save files between cartridge formats and editor formats. Everything runs in your browser: the file is not uploaded anywhere.</p>
+  </header>
+
+  <section>
+    <h2>1 · Conversion</h2>
+    <div class="choice ui" role="radiogroup" aria-label="Conversion type">
+      <label>
+        <input type="radio" name="mode" value="journal" checked>
+        <span><b>Journal EEPROM → normal</b><small>journal save, into the previous interleaved format</small></span>
+      </label>
+      <label>
+        <input type="radio" name="mode" value="decode">
+        <span><b>Flash → SRAM</b><small>64 KB with one byte in two, to open in an editor (32 KB)</small></span>
+      </label>
+      <label>
+        <input type="radio" name="mode" value="encode">
+        <span><b>SRAM → Flash</b><small>32 KB from the editor, to write back to the cartridge (64 KB)</small></span>
+      </label>
+    </div>
+  </section>
+
+  <section id="lfSection">
+    <h2>2 · Interleave step</h2>
+    <div class="choice ui" role="radiogroup" aria-label="Interleave step">
+      <label>
+        <input type="radio" name="lf" value="7" checked>
+        <span><b>EEPROM 4 Kbit · lf 7</b><small>64 blocks, one logical byte every 128. E.g. Super Mario Advance, Rayman.</small></span>
+      </label>
+      <label>
+        <input type="radio" name="lf" value="3">
+        <span><b>EEPROM 64 Kbit · lf 3</b><small>1024 blocks, one logical byte every 8.</small></span>
+      </label>
+    </div>
+  </section>
+
+  <section>
+    <h2 id="fileHead">3 · Save file</h2>
+    <label class="drop ui" id="drop">
+      <strong id="dropMain">Choose the .sav file</strong>
+      <span id="dropSub">or drop it here · 128 KB</span>
+      <input type="file" id="file" accept=".sav,.srm,.bin,application/octet-stream">
+    </label>
+  </section>
+
+  <section id="result" hidden>
+    <h2>4 · Result</h2>
+    <div class="msg err ui" id="err" role="alert"></div>
+    <div class="msg warn ui" id="warn"></div>
+    <dl class="report" id="report"></dl>
+    <pre class="hex" id="hex" hidden></pre>
+    <div class="namerow" id="nameRow" hidden>
+      <label for="outName">File name</label>
+      <input type="text" id="outName" spellcheck="false">
+    </div>
+    <button class="go ui" id="go" disabled>Download</button>
+  </section>
+
+  <footer class="ui">
+    <b>Flash → SRAM</b> takes one byte in two (even positions) from the 64 KB save.
+    <br><b>SRAM → Flash</b> does the reverse: writes each byte to the even positions of a 64 KB area, the rest set to 0xFF, as the cartridge expects.
+    <br><b>Journal → normal</b> rebuilds the save from the journal and writes it in the previous interleaved format.
+  </footer>
+</div>
+
+<script>
+/*CORE-BEGIN*/
+// Journal logic, identical to ejournal.c: slot valido = generazione piu'
+// alta con firma GBJ1; base = 1024 blocchi da 8 byte a partire da slot+16;
+// il journal si legge tutto e l'ultimo record per blocco vince; indice
+// 0xFFFF = buco o fine, saltato.
+const JW = { WINDOW: 0x10000, SLOT_A: 0x0000, SLOT_B: 0x3000, HDR: 16,
+             JOURNAL: 0x6000, REC: 10, BLK: 8, BLOCKS_MAX: 1024, NONE: 0xFFFF };
+const JMAGIC = [0x47, 0x42, 0x4A, 0x31]; // "GBJ1"
+
+function slotValid(buf, base) {
+  for (let i = 0; i < 4; i++) if (buf[base + 12 + i] !== JMAGIC[i]) return false;
+  return true;
+}
+function slotGen(buf, base) {
+  return (buf[base] | (buf[base + 1] << 8) | (buf[base + 2] << 16) | (buf[base + 3] << 24)) >>> 0;
+}
+function isBlankAt(buf, o, n) {
+  for (let i = 0; i < n; i++) if (buf[o + i] !== 0xFF) return false;
+  return true;
+}
+function blockBlank(d) {
+  for (let i = 0; i < d.length; i++) if (d[i] !== 0xFF) return false;
+  return true;
+}
+function decodeJournal(buf) {
+  const aOk = slotValid(buf, JW.SLOT_A);
+  const bOk = slotValid(buf, JW.SLOT_B);
+  const info = { genA: null, genB: null, slot: null, records: 0,
+                 badIndex: 0, blocks: [], noBase: false };
+  if (aOk) info.genA = slotGen(buf, JW.SLOT_A);
+  if (bOk) info.genB = slotGen(buf, JW.SLOT_B);
+  // Slot mai scritto (intestazione tutta a 0xFF) contro slot con dati senza firma.
+  info.emptyA = isBlankAt(buf, JW.SLOT_A, JW.HDR);
+  info.emptyB = isBlankAt(buf, JW.SLOT_B, JW.HDR);
+  if (!aOk && !bOk) {
+    // Nessuno slot valido: la base non esiste. I blocchi restano a 0xFF,
+    // cosi' la conversione funziona anche su un salvataggio vuoto.
+    info.noBase = true;
+    for (let b = 0; b < JW.BLOCKS_MAX; b++) info.blocks.push(new Uint8Array(JW.BLK).fill(0xFF));
+    return info;
+  }
+  if (aOk && bOk) info.slot = info.genB > info.genA ? JW.SLOT_B : JW.SLOT_A;
+  else info.slot = aOk ? JW.SLOT_A : JW.SLOT_B;
+
+  for (let b = 0; b < JW.BLOCKS_MAX; b++) {
+    const o = info.slot + JW.HDR + b * JW.BLK;
+    info.blocks.push(buf.slice(o, o + JW.BLK));
+  }
+  const nrec = (JW.WINDOW - JW.JOURNAL) / JW.REC;
+  for (let n = 0; n < nrec; n++) {
+    const o = JW.JOURNAL + n * JW.REC;
+    const idx = buf[o + 8] | (buf[o + 9] << 8);
+    if (idx === JW.NONE) continue;
+    if (idx >= JW.BLOCKS_MAX) { info.badIndex++; continue; }
+    info.records++;
+    info.blocks[idx] = buf.slice(o, o + JW.BLK);
+  }
+  return info;
+}
+// Blocks the interleaved format with this lf can hold.
+function maxBlocks(lf) { return JW.WINDOW >> (3 + lf); }
+function blocksBeyond(info, lf) {
+  let c = 0;
+  for (let b = maxBlocks(lf); b < JW.BLOCKS_MAX; b++)
+    if (!blockBlank(info.blocks[b])) c++;
+  return c;
+}
+function toInterleaved(info, lf) {
+  const out = new Uint8Array(JW.WINDOW).fill(0xFF);
+  const nmax = maxBlocks(lf);
+  for (let b = 0; b < nmax; b++) {
+    const d = info.blocks[b];
+    for (let i = 0; i < 8; i++) out[(b * 8 + i) << lf] = d[i];
+  }
+  return out;
+}
+
+// Flash 64 KB, data in even positions -> SRAM 32 KB.
+function flashToSram(input) {
+  if (input.length !== 0x10000 && input.length !== 0x20000)
+    throw new Error(`A flash save is 64 KB or 128 KB. This file is ${input.length} bytes.`);
+  const buf = input.subarray(0, 0x10000);
+  const out = new Uint8Array(0x8000);
+  for (let i = 0; i < 0x8000; i++) out[i] = buf[i * 2];
+  return out;
+}
+// SRAM 32 KB -> Flash 64 KB, data in even positions, rest 0xFF.
+function sramToFlash(buf) {
+  if (buf.length > 0x8000)
+    throw new Error(`An SRAM save is at most 32 KB (32768 bytes). This file is ${buf.length} bytes.`);
+  const src = new Uint8Array(0x8000).fill(0xFF);
+  src.set(buf);
+  const out = new Uint8Array(0x10000).fill(0xFF);
+  for (let i = 0; i < 0x8000; i++) out[i * 2] = src[i];
+  return out;
+}
+/*CORE-END*/
+
+// ---- interfaccia ----
+const $ = (id) => document.getElementById(id);
+let mode = "journal";
+let current = null;   // { name, buf }
+let output = null;    // Uint8Array pronto per il download
+
+function lfValue() {
+  return Number(document.querySelector('input[name="lf"]:checked').value);
+}
+function baseName(name) { return name.replace(/\.[^.]+$/, ""); }
+function setMsg(id, text) { $(id).textContent = text || ""; }
+function addRow(label, value) {
+  const div = document.createElement("div");
+  const dt = document.createElement("dt"); dt.textContent = label;
+  const dd = document.createElement("dd"); dd.textContent = value;
+  div.append(dt, dd);
+  $("report").append(div);
+}
+function hexPreview(bytes) {
+  const lines = [];
+  for (let row = 0; row < 64; row += 16) {
+    let hex = "", asc = "";
+    for (let c = 0; c < 16; c++) {
+      const b = bytes[row + c];
+      hex += b.toString(16).padStart(2, "0") + " ";
+      asc += (b >= 32 && b < 127) ? String.fromCharCode(b) : ".";
+    }
+    lines.push(row.toString(16).padStart(6, "0") + "  " + hex + " " + asc);
+  }
+  return lines.join("\n");
+}
+
+function runJournal(buf) {
+  if (buf.length === 0x20000) {
+    buf = buf.subarray(0, JW.WINDOW);
+    setMsg("warn", "128 KB file: using only the first 64 KB, the rest is discarded.");
+  }
+  if (buf.length !== JW.WINDOW)
+    throw new Error(`The file is ${buf.length} bytes. A flash EEPROM save is 65536 bytes.`);
+  const info = decodeJournal(buf);
+  const lf = lfValue();
+  const nmax = maxBlocks(lf);
+
+  if (info.noBase) {
+    if (info.records === 0 && buf.every((x) => x === 0xFF)) {
+      setMsg("warn", "The save is empty: no data to convert. The result will be a file filled with 0xFF.");
+      output = toInterleaved(info, lf);
+    } else {
+      throw new Error("This does not look like a journal save: the GBJ1 header is missing from both slots. It may already be in the normal format, or be a native flash save.");
+    }
+  } else {
+    const beyond = blocksBeyond(info, lf);
+    if (beyond > 0) {
+      throw new Error(`There are ${beyond} blocks beyond the ${nmax}-block limit for lf ${lf}. With this step you would lose data: choose lf 3 if the game is 64 Kbit.`);
+    }
+    output = toInterleaved(info, lf);
+  }
+
+  let present = 0;
+  for (let b = 0; b < nmax; b++) if (!blockBlank(info.blocks[b])) present++;
+  if (info.noBase) {
+    addRow("Active slot", "none");
+  } else {
+    addRow("Active slot", info.slot === JW.SLOT_A ? "A" : "B");
+    addRow("Generation A", info.genA !== null ? String(info.genA) : (info.emptyA ? "never written" : "invalid"));
+    addRow("Generation B", info.genB !== null ? String(info.genB) : (info.emptyB ? "never written" : "invalid"));
+  }
+  addRow("Journal records", String(info.records));
+  if (info.badIndex) addRow("Records with out-of-range index", String(info.badIndex));
+  addRow(`Blocks with data (0–${nmax - 1})`, String(present));
+  return baseName(current.name) + `_interlacciato_lf${lf}.sav`;
+}
+
+function runDecode(buf) {
+  output = flashToSram(buf);
+  setMsg("warn", buf.length === 0x20000 ? "128 KB file: using only the first 64 KB, the rest is discarded." : "");
+  $("hex").textContent = hexPreview(output);
+  $("hex").hidden = false;
+  addRow("Input", buf.length + " bytes");
+  addRow("Output", output.length + " bytes (SRAM)");
+  return baseName(current.name) + "_flat.srm";
+}
+
+function runEncode(buf) {
+  output = sramToFlash(buf);
+  $("hex").textContent = hexPreview(output);
+  $("hex").hidden = false;
+  addRow("Input", buf.length + " bytes");
+  addRow("Output", output.length + " bytes (Flash)");
+  if (buf.length < 0x8000)
+    setMsg("warn", "The file is shorter than 32 KB: the rest is padded with 0xFF.");
+  return baseName(current.name) + "_flash.sav";
+}
+
+function run() {
+  output = null;
+  $("go").disabled = true;
+  $("report").replaceChildren();
+  $("hex").hidden = true; $("hex").textContent = "";
+  $("nameRow").hidden = true;
+  setMsg("err", ""); setMsg("warn", "");
+  $("result").hidden = !current;
+  if (!current) return;
+
+  try {
+    let name;
+    if (mode === "journal") name = runJournal(current.buf);
+    else if (mode === "decode") name = runDecode(current.buf);
+    else name = runEncode(current.buf);
+    $("outName").value = name;
+    $("nameRow").hidden = false;
+    $("go").disabled = false;
+  } catch (e) {
+    output = null;
+    setMsg("err", e.message);
+  }
+}
+
+function load(file) {
+  const r = new FileReader();
+  r.onload = () => {
+    current = { name: file.name, buf: new Uint8Array(r.result) };
+    run();
+  };
+  r.readAsArrayBuffer(file);
+}
+
+function setMode(m) {
+  mode = m;
+  $("lfSection").hidden = m !== "journal";
+  const copy = {
+    journal: ["3 · Save file", "Choose the .sav file", "or drop it here · 128 KB"],
+    decode:  ["3 · Flash save", "Choose the .sav file from the cartridge", "or drop it here · 128 KB"],
+    encode:  ["3 · SRAM save", "Choose the .srm file from the editor", "or drop it here · 32 KB"],
+  }[m];
+  $("fileHead").textContent = copy[0];
+  $("dropMain").textContent = copy[1];
+  $("dropSub").textContent = copy[2];
+  // Cambiare modalita' scarta il file caricato: va scelto di nuovo.
+  current = null;
+  $("file").value = "";
+  run();
+}
+
+document.querySelectorAll('input[name="mode"]').forEach((el) =>
+  el.addEventListener("change", (e) => setMode(e.target.value)));
+document.querySelectorAll('input[name="lf"]').forEach((el) =>
+  el.addEventListener("change", () => { if (mode === "journal") run(); }));
+
+$("file").addEventListener("change", (e) => {
+  if (e.target.files[0]) load(e.target.files[0]);
+});
+const drop = $("drop");
+["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => {
+  e.preventDefault(); drop.classList.add("over");
+}));
+["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => {
+  e.preventDefault(); drop.classList.remove("over");
+}));
+drop.addEventListener("drop", (e) => {
+  const f = e.dataTransfer.files[0];
+  if (f) load(f);
+});
+
+$("go").addEventListener("click", () => {
+  if (!output) return;
+  const name = $("outName").value.trim() || "save.sav";
+  const url = URL.createObjectURL(new Blob([output], { type: "application/octet-stream" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+</script>
