@@ -25,8 +25,8 @@
  * Sempre nella Flash. Quello che teniamo in EWRAM e' solo un indice per
  * non riscandire il journal a ogni lettura: se il gioco ce lo sovrascrive
  * o lo troviamo invalido, si ricostruisce leggendo. Nessun dato esiste
- * unicamente in RAM, tranne nelle due finestre esplicitamente marcate
- * dentro la migrazione e la compattazione su chip a blocco unico.
+ * unicamente in RAM, tranne i pochi blocchi messi in salvo all'inizio
+ * della migrazione, nel tratto esplicitamente marcato.
  *
  * FORMATO SUI 64 KB DELLA FINESTRA
  *
@@ -37,12 +37,11 @@
  * Lo slot valido e' quello con il numero di generazione piu' alto. I due
  * slot servono alla compattazione: si riempie quello inattivo e solo
  * quando e' completo si dichiara valido, cosi' esiste sempre una copia
- * buona. Su un chip Intel, dove l'unita' di cancellazione e' l'intero
- * blocco da 64 KB, i due slot non possono proteggere da un'interruzione -
- * la cancellazione li porta via entrambi - e la compattazione ha una
- * finestra di vulnerabilita' di un paio di secondi, una volta ogni
- * qualche migliaio di scritture. Il formato pero' resta identico, cosi'
- * un salvataggio e' leggibile su entrambe le famiglie.
+ * buona. Funziona perche' il chip cancella a settori da 4 KB: slot A,
+ * slot B e journal occupano settori distinti e si cancellano uno
+ * indipendentemente dall'altro. Il supporto ai chip a blocco unico da
+ * 64 KB (Intel/Sharp), che c'era in una versione precedente, e' stato
+ * tolto insieme al resto di quel protocollo.
  *
  * Intestazione dello slot (16 byte):
  *   +0  numero di generazione, 4 byte little endian
@@ -72,7 +71,6 @@
  *   static unsigned char   ej_rd(unsigned off);
  *   static int             ej_pgm(unsigned off, const unsigned char *s, unsigned n);
  *   static int             ej_erase(unsigned off);
- *   static int             ej_single_block(void);
  *   static struct ej_ctrl *ej_ctrl(void);
  *   static unsigned short *ej_index(void);
  *   static unsigned char  *ej_tmp(unsigned *len);
@@ -245,14 +243,7 @@ static int ej_rec_blank(unsigned n)
 /* cancellazione                                                      */
 /* ---------------------------------------------------------------- */
 
-/* Cancella l'intervallo [from, to), un settore per volta.
- *
- * DA CHIAMARE SOLO quando ej_single_block() e' falso. Su un chip a
- * blocco unico non esiste il concetto di intervallo: qualunque
- * cancellazione porta via tutti i 64 KB, quindi i percorsi che devono
- * funzionare anche li' cancellano una volta sola, all'inizio, e non
- * chiamano mai questa. Tenere separate le due cose evita di cancellare
- * per sbaglio una base appena scritta. */
+/* Cancella l'intervallo [from, to), un settore per volta. */
 static int ej_erase_range(unsigned from, unsigned to)
 {
     for (unsigned o = from; o < to; o += EJ_SECTOR)
@@ -404,83 +395,33 @@ static int ej_compact(void)
     unsigned seq = 0;
     (void) ej_hdr_read(c->slot, &seq);
 
-    if (ej_single_block())
+    /* Due slot: si riempie quello inattivo e lo si dichiara valido solo
+     * alla fine. Fino a quel momento la base vecchia e il journal restano
+     * intatti, quindi una interruzione in qualsiasi punto lascia lo stato
+     * precedente perfettamente leggibile. */
+    int dst = c->slot ? 0 : 1;
+    unsigned dbase = ej_slot_base(dst);
+    if (!ej_erase_range(dbase, dbase + EJ_SLOT_SPAN))
+        return 0;
+    for (unsigned b = 0; b < EJ_BLOCKS_MAX; ++b)
     {
-        /* Unita' di cancellazione unica: non esiste un posto dove
-         * costruire la nuova base senza distruggere la vecchia. Si legge
-         * tutto in RAM, si cancella e si riscrive.
-         *
-         * FINESTRA DI VULNERABILITA': da qui alla scrittura
-         * dell'intestazione i dati esistono solo in RAM. E' il limite del
-         * blocco da 64 KB, non aggirabile senza un secondo blocco
-         * indirizzabile, e capita una volta ogni EJ_RECS scritture. */
-        unsigned tlen = 0;
-        unsigned char *tmp = ej_tmp(&tlen);
-        if (tlen < EJ_BLOCKS_MAX * EJ_BLK)
-            return 0;
-
-        /* L'immagine si costruisce leggendo la Flash, non consultando
-         * l'indice, e tutto cio' che serve viene copiato in variabili
-         * locali prima di toccare il buffer. Cosi' il modulo resta
-         * corretto qualunque sia la posizione che il chiamante ha dato al
-         * buffer temporaneo, anche se ricoprisse indice o controllo. */
-        unsigned act = ej_slot_base(c->slot) + EJ_HDR_LEN;
-        unsigned nrec = c->head;
-        for (unsigned i = 0; i < EJ_BLOCKS_MAX * EJ_BLK; ++i)
-            tmp[i] = ej_rd(act + i);
-        for (unsigned n = 0; n < nrec; ++n)
-        {
-            unsigned bi = ej_rec_index(n);
-            if (bi >= EJ_BLOCKS_MAX)
-                continue;
-            unsigned r = ej_rec_off(n);
-            for (unsigned i = 0; i < EJ_BLK; ++i)
-                tmp[bi * EJ_BLK + i] = ej_rd(r + i);
-        }
-        if (!ej_erase(0))
-            return 0;
-        for (unsigned b = 0; b < EJ_BLOCKS_MAX; ++b)
-        {
-            unsigned char *s = tmp + b * EJ_BLK;
-            unsigned d = EJ_SLOT_A + EJ_HDR_LEN + b * EJ_BLK;
-            for (unsigned i = 0; i < EJ_BLK; ++i)
-                if (s[i] != 0xFF && !ej_pgm(d + i, s + i, 1))
-                    return 0;
-        }
-        if (!ej_hdr_write(0, seq + 1))
-            return 0;
-        c->slot = 0;
+        unsigned char v[EJ_BLK];
+        ej_fetch(b, v);
+        unsigned d = dbase + EJ_HDR_LEN + b * EJ_BLK;
+        for (unsigned i = 0; i < EJ_BLK; ++i)
+            if (v[i] != 0xFF && !ej_pgm(d + i, v + i, 1))
+                return 0;
     }
-    else
-    {
-        /* Due slot: si riempie quello inattivo e lo si dichiara valido
-         * solo alla fine. Fino a quel momento la base vecchia e il
-         * journal restano intatti, quindi una interruzione in qualsiasi
-         * punto lascia lo stato precedente perfettamente leggibile. */
-        int dst = c->slot ? 0 : 1;
-        unsigned dbase = ej_slot_base(dst);
-        if (!ej_erase_range(dbase, dbase + EJ_SLOT_SPAN))
-            return 0;
-        for (unsigned b = 0; b < EJ_BLOCKS_MAX; ++b)
-        {
-            unsigned char v[EJ_BLK];
-            ej_fetch(b, v);
-            unsigned d = dbase + EJ_HDR_LEN + b * EJ_BLK;
-            for (unsigned i = 0; i < EJ_BLK; ++i)
-                if (v[i] != 0xFF && !ej_pgm(d + i, v + i, 1))
-                    return 0;
-        }
-        if (!ej_hdr_write(dst, seq + 1))
-            return 0;
-        c->slot = (unsigned char) dst;
+    if (!ej_hdr_write(dst, seq + 1))
+        return 0;
+    c->slot = (unsigned char) dst;
 
-        /* Da qui la nuova base e' quella buona. Se la corrente manca
-         * adesso, al riavvio si sceglie lo slot con generazione piu'
-         * alta e si rigioca un journal i cui record sono gia' tutti
-         * incorporati: stessi valori, nessun danno. */
-        if (!ej_erase_range(EJ_JOURNAL, EJ_WINDOW))
-            return 0;
-    }
+    /* Da qui la nuova base e' quella buona. Se la corrente manca adesso,
+     * al riavvio si sceglie lo slot con generazione piu' alta e si rigioca
+     * un journal i cui record sono gia' tutti incorporati: stessi valori,
+     * nessun danno. */
+    if (!ej_erase_range(EJ_JOURNAL, EJ_WINDOW))
+        return 0;
 
     ej_clear_index();
     c->head = 0;
@@ -532,61 +473,40 @@ static int ej_migrate(int old_lf)
     if (tlen < rescue * EJ_BLK)
         return 0;
 
-    if (ej_single_block())
+    /* Mettiamo al sicuro i soli blocchi che vivono dentro lo slot A, poi
+     * cancelliamo quei tre settori. Il resto del vecchio salvataggio, da
+     * 0x3000 in su, non viene toccato finche' la nuova base non e'
+     * completa.
+     *
+     * FINESTRA DI VULNERABILITA': dalla cancellazione qui sotto alla
+     * riscrittura dei blocchi messi in salvo, quei blocchi esistono solo
+     * in RAM. Capita una volta sola, al primo salvataggio dopo la
+     * conversione. */
+    for (unsigned b = 0; b < rescue; ++b)
+        for (unsigned i = 0; i < EJ_BLK; ++i)
+            tmp[b * EJ_BLK + i] = ej_rd(b * stride + i * step);
+
+    if (!ej_erase_range(EJ_SLOT_A, EJ_SLOT_A + EJ_SLOT_SPAN))
+        return 0;
+
+    /* Prima i blocchi messi in salvo, per accorciare il tratto in cui
+     * esistono soltanto in RAM. */
+    for (unsigned b = 0; b < rescue; ++b)
     {
-        /* Blocco unico: non si puo' cancellare una parte sola, quindi
-         * serve l'immagine intera in RAM.
-         *
-         * FINESTRA DI VULNERABILITA': vale l'intera migrazione. Capita
-         * una volta sola, al primo salvataggio dopo la conversione. */
-        if (tlen < EJ_BLOCKS_MAX * EJ_BLK)
-            return 0;
-        for (unsigned b = 0; b < nblocks; ++b)
-            for (unsigned i = 0; i < EJ_BLK; ++i)
-                tmp[b * EJ_BLK + i] = ej_rd(b * stride + i * step);
-        if (!ej_erase(0))
-            return 0;
-        for (unsigned b = 0; b < nblocks; ++b)
-        {
-            unsigned char *s = tmp + b * EJ_BLK;
-            unsigned d = EJ_SLOT_A + EJ_HDR_LEN + b * EJ_BLK;
-            for (unsigned i = 0; i < EJ_BLK; ++i)
-                if (s[i] != 0xFF && !ej_pgm(d + i, s + i, 1))
-                    return 0;
-        }
+        unsigned char *s = tmp + b * EJ_BLK;
+        unsigned d = EJ_SLOT_A + EJ_HDR_LEN + b * EJ_BLK;
+        for (unsigned i = 0; i < EJ_BLK; ++i)
+            if (s[i] != 0xFF && !ej_pgm(d + i, s + i, 1))
+                return 0;
     }
-    else
+    for (unsigned b = rescue; b < nblocks; ++b)
     {
-        /* Mettiamo al sicuro i soli blocchi che vivono dentro lo slot A,
-         * poi cancelliamo quei tre settori. Il resto del vecchio
-         * salvataggio, da 0x3000 in su, non viene toccato finche' la
-         * nuova base non e' completa. */
-        for (unsigned b = 0; b < rescue; ++b)
-            for (unsigned i = 0; i < EJ_BLK; ++i)
-                tmp[b * EJ_BLK + i] = ej_rd(b * stride + i * step);
-
-        if (!ej_erase_range(EJ_SLOT_A, EJ_SLOT_A + EJ_SLOT_SPAN))
-            return 0;
-
-        /* Prima i blocchi messi in salvo, per accorciare il tratto in cui
-         * esistono soltanto in RAM. */
-        for (unsigned b = 0; b < rescue; ++b)
+        unsigned d = EJ_SLOT_A + EJ_HDR_LEN + b * EJ_BLK;
+        for (unsigned i = 0; i < EJ_BLK; ++i)
         {
-            unsigned char *s = tmp + b * EJ_BLK;
-            unsigned d = EJ_SLOT_A + EJ_HDR_LEN + b * EJ_BLK;
-            for (unsigned i = 0; i < EJ_BLK; ++i)
-                if (s[i] != 0xFF && !ej_pgm(d + i, s + i, 1))
-                    return 0;
-        }
-        for (unsigned b = rescue; b < nblocks; ++b)
-        {
-            unsigned d = EJ_SLOT_A + EJ_HDR_LEN + b * EJ_BLK;
-            for (unsigned i = 0; i < EJ_BLK; ++i)
-            {
-                unsigned char v = ej_rd(b * stride + i * step);
-                if (v != 0xFF && !ej_pgm(d + i, &v, 1))
-                    return 0;
-            }
+            unsigned char v = ej_rd(b * stride + i * step);
+            if (v != 0xFF && !ej_pgm(d + i, &v, 1))
+                return 0;
         }
     }
 
@@ -595,12 +515,8 @@ static int ej_migrate(int old_lf)
     c->slot = 0;
 
     /* Da qui la nuova base e' valida: il vecchio salvataggio non serve
-     * piu' e la sua area diventa slot B e journal.
-     *
-     * Solo sui chip a settori: su un blocco unico e' gia' stato
-     * cancellato tutto all'inizio, e una cancellazione adesso porterebbe
-     * via la base appena scritta. */
-    if (!ej_single_block() && !ej_erase_range(EJ_SLOT_B, EJ_WINDOW))
+     * piu' e la sua area diventa slot B e journal. */
+    if (!ej_erase_range(EJ_SLOT_B, EJ_WINDOW))
         return 0;
 
     ej_clear_index();

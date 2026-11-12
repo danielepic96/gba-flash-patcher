@@ -1,5 +1,3 @@
-#include <stdint.h>
-
 asm(R"(
     .section .text
     .align 2
@@ -67,76 +65,150 @@ static struct eeprom_meta *get_eeprom_meta(void)
  * fondo, quindi la cima e' la zona che viene occupata per ultima ed e'
  * li' che ci mettiamo.
  *
- * AMD/JEDEC, invariato rispetto alla versione precedente:
- *   0x0203F7F8 .. 0x0203F7FF   cache del protocollo, 8 byte
- *   0x0203F800 .. 0x0203FFFF   buffer, 2 KB (se ne usa 0x1000>>lf)
+ * Giochi SRAM:
+ *   0x0203F7F8 .. 0x0203F7FB   indirizzo delle routine di lettura in RAM
+ *   0x0203F7FC .. 0x0203F7FF   cache del descrittore del chip
+ *   0x0203F800 .. 0x0203FFFF   buffer del settore, 2 KB (se ne usa
+ *                              0x1000>>lf)
  *
- * Intel/Sharp, ancorato in cima e lungo quanto serve (0x10000>>lf):
- *   0x0203FE00 .. 0x0203FFFF     512 byte   con loadfactor_log2 = 7
- *   0x0203E000 .. 0x0203FFFF       8 KB     con loadfactor_log2 = 3
- *   0x02038000 .. 0x0203FFFF      32 KB     con loadfactor_log2 = 1
+ * I giochi EEPROM non usano il buffer del settore: hanno il journal, che
+ * ha la sua mappa poco piu' sotto e riusa le stesse due celle. Le due
+ * mappe non convivono mai, perche' una cartuccia e' o SRAM o EEPROM.
  *
- * Perche' su Intel serve tanto: l'unita' di cancellazione e' un blocco
- * da 64 KB, cioe' l'intera area di salvataggio. Con un buffer da 2 KB il
- * giro lettura-modifica-riscrittura non si chiude e tutto cio' che sta
- * fuori dalla finestra scritta viene perso; con un buffer grande quanto
- * l'area si chiude, e non si perde niente.
+ * CHIP RICONOSCIUTI
  *
- * Il prezzo e' che su una cartuccia Intel quella memoria viene
- * sovrascritta durante il salvataggio: se il gioco la stava usando si
- * guasta. E' una scelta deliberata - meglio un guasto immediato e
- * visibile che un salvataggio che si porta via gli altri slot in
- * silenzio - e non ha alcun effetto sulle cartucce AMD, dove questa
- * memoria non viene mai toccata.
+ * Il chip viene identificato una volta (comando 0x90) e da li' ogni
+ * operazione si regola sui suoi parametri. La tabella e' quella della
+ * libreria FLASH_V123, letta dal disassemblato di Golden Sun - L'Era
+ * Perduta; e' una libreria per chip da 64 KB, senza cambio banco, cioe'
+ * esattamente il nostro caso.
  *
- * Con loadfactor_log2 1 o 3 il buffer Intel ricopre anche gli 8 byte
- * della cache del protocollo, che viene percio' riscritta alla fine di
- * write_core_patched.
+ *   chip                  codici     wait  tetto     dopo la           bit di
+ *                                    state erase     cancellazione     stato
+ *   SST 39VF512           0xBF 0xD4    1     40 tick controllo+margine   no
+ *   SST 39xF010/020/040   0xBF 0xD5-D7 3     40 tick niente              no
+ *   Macronix MX29L512     0xC2 0x1C    3   2000 tick niente              si'
+ *   Macronix MX29L010     0xC2 0x09    3   2000 tick niente              si'
+ *   Panasonic MN63F805MNP 0x32 0x1B    0    500 tick niente              no
+ *   Sanyo LE26FV10N1TS    0x62 0x13    3   2000 tick niente              si'
+ *   Atmel AT29LV512       0x1F 0x3D    3   (pagine da 128 byte, 40 tick)
+ *   sconosciuto           -            3     40 tick controllo+margine   no
  *
- * I giochi EEPROM non passano da qui: usano il journal, che ha la sua
- * mappa poco piu' sotto. Le due non convivono mai, perche' una cartuccia
- * e' o SRAM o EEPROM. */
+ * Il program di un byte ha per tutti il tetto di 10 tick.
+ *
+ * "Wait state" e' quello tenuto durante cancellazione e program; letture
+ * e verifica girano sempre a 3, e a 3 lo si rimette alla fine di ogni
+ * operazione, come fa la libreria.
+ *
+ * "Controllo+margine" e' la routine che la libreria usa per SST e per i
+ * chip sconosciuti: dopo la cancellazione si verifica che l'intero settore
+ * sia a 0xFF e, se non lo e', si ripete fino a 80 volte; poi si cancella
+ * ancora per margine, una volta se era riuscita subito e sei se aveva
+ * avuto bisogno di ripetizioni. Macronix e Panasonic cancellano e basta.
+ *
+ * DOVE CI SI SCOSTA DA GOLDEN SUN, e perche':
+ *
+ *  - SST 39LF/VF010, 020 e 040 (0xD5, 0xD6, 0xD7) non sono in nessuna
+ *    libreria Nintendo: sono i chip delle cartucce repro, e lo 040 e'
+ *    quello montato sulla ChisCart. I parametri vengono dal loro
+ *    datasheet (DS20005023): cancellazione del settore in 25 ms al
+ *    massimo, program in 20 us, e fine operazione segnalata dal bit 7,
+ *    che e' cio' che l'attesa guarda confrontando il byte intero. Niente
+ *    bit 5: su questi chip non e' un bit di stato - il datasheet dichiara
+ *    validi i soli bit 7 e 6 - quindi non lo si interpreta. E niente
+ *    controllo+margine: quella routine serve a chi non sa dire quando ha
+ *    finito, e raddoppia le cancellazioni su un chip garantito per 10000.
+ *    Wait state 3 perche' e' quello con cui la ChisCart e' stata provata.
+ *  - Macronix e' riconosciuto con due codici: lo 0x1C del chip da 512
+ *    Kbit, che e' l'unico di FLASH_V123, e lo 0x09 di quello da 1 Mbit,
+ *    che viene da FLASH1M_V103. Non dal solo costruttore: un Macronix di
+ *    un'altra serie potrebbe avere settori piu' grandi di 4 KB, e finisce
+ *    fra gli sconosciuti come ogni altro chip che non conosciamo.
+ *  - Su Macronix l'attesa guarda anche il bit 5, manda il reset a tutti i
+ *    fallimenti e la cancellazione si ritenta fino a cinque volte. E' la
+ *    logica della libreria FLASH1M_V103 (Smeraldo) ed e' il percorso
+ *    provato sulla ChisCart. FLASH_V123 su Macronix non guarda il bit 5 e
+ *    cancella una volta sola.
+ *  - Sanyo non e' in FLASH_V123: e' preso da FLASH1M_V103, dove usa le
+ *    stesse funzioni e gli stessi tempi di Macronix.
+ *  - Le ottimizzazioni di scrittura restano: si cancella solo quando un
+ *    bit deve tornare a 1, dopo la cancellazione i byte a 0xFF si rileggono
+ *    invece di programmarli, e le EEPROM passano dal journal. La libreria
+ *    riscrive sempre il settore intero, ma lei serve giochi Flash che
+ *    salvano a settori; noi adattiamo SRAM ed EEPROM, che scrivono a pezzi.
+ *
+ * Il ramo Intel/Sharp che c'era in una versione precedente e' stato
+ * tolto: chip con quei comandi sulla finestra di salvataggio non se ne
+ * conoscono. */
 #define SCRATCH_BUF_ADDR (0x0203F800)
 #define SCRATCH_BUF_SIZE (2048)
-#define EWRAM_END        (0x02040000)
-#define FLASH_MAX_ATTEMPTS 3
+/* Descrittore del chip: un byte che riassume la riga della tabella qui
+ * sopra. Sta in una parola invece che in una tabella di costanti perche'
+ * il payload e' fatto di sola .text - il linker scarta tutto il resto -
+ * e per lo stesso motivo le scelte sono catene di if e non switch. */
+#define CF_WAIT_MASK     0x03   /* wait state durante erase e program     */
+#define CF_STATUS        0x04   /* bit 5, reset e tentativi multipli      */
+#define CF_VERIFY        0x08   /* controllo del settore e margine        */
+#define CF_ATMEL         0x10   /* scrittura a pagine                     */
+#define CF_ERASE_40      0x00   /* tetto della cancellazione, in tick     */
+#define CF_ERASE_500     0x20
+#define CF_ERASE_2000    0x40
+#define CF_ERASE_MASK    0x60
 
-/* Tetto di attesa, su entrambi i protocolli.
+#define CHIP_SST         (1 | CF_VERIFY | CF_ERASE_40)
+#define CHIP_SST39       (3 | CF_ERASE_40)
+#define CHIP_MACRONIX    (3 | CF_STATUS | CF_ERASE_2000)
+#define CHIP_PANASONIC   (0 | CF_ERASE_500)
+#define CHIP_SANYO       (3 | CF_STATUS | CF_ERASE_2000)
+#define CHIP_ATMEL       (3 | CF_ATMEL)
+#define CHIP_UNKNOWN     (3 | CF_VERIFY | CF_ERASE_40)
+
+/* Chip con CF_STATUS, come EraseFlashSector_MX di FLASH1M_V103: un
+ * tentativo piu' fino a quattro ripetizioni, cinque in tutto. Gli altri
+ * chip senza CF_VERIFY cancellano una volta sola, come in FLASH_V123. */
+#define FLASH_ERASE_ATTEMPTS 5
+/* Chip con CF_VERIFY, come la routine SST di FLASH_V123: fino a 80 ripetizioni
+ * (si rinuncia all'ottantunesimo fallimento), poi le cancellazioni di
+ * margine. */
+#define FLASH_B_ERASE_GIVEUP   0x51
+#define FLASH_B_MARGIN_CLEAN   1
+#define FLASH_B_MARGIN_RETRIED 6
+/* Atmel, come le routine Atmel di FLASH_V123: tre tentativi per
+ * pagina. */
+#define ATMEL_PAGE          128u
+#define ATMEL_PAGE_ATTEMPTS 3
+
+/* Tetto di attesa.
  *
- * Su AMD la via d'uscita la darebbe il chip: DQ5 e' il flag del suo timer
+ * La via d'uscita la darebbe il chip: DQ5 e' il flag del suo timer
  * interno e si alza MENTRE l'operazione e' ancora in corso, quindi basta
- * guardarlo. Ma vale solo per un chip che DQ5 lo implementa davvero, e
- * AMD e' il ripiego di ogni identificazione fallita - e' cioe' il ramo su
- * cui finisce anche un chip che non abbiamo riconosciuto. Un chip Intel
- * scambiato per AMD resta in read array, le scritture di sblocco non
- * significano niente per lui, e la lettura restituisce il byte
- * memorizzato: durante un erase aspettiamo bit 7 a 1, quindi un banale
- * 0x00 nel salvataggio da bit 7 diverso e bit 5 a zero, e si gira per
- * sempre. Il contatore e' la seconda rete dietro DQ5.
- *
- * Su Intel non esiste nemmeno la prima rete: SR.4 e SR.5 sono bit di
- * esito, validi solo quando SR.7 vale 1, e finche' il chip e' occupato
- * leggono 0. Li' il contatore e' l'unica uscita.
+ * guardarlo. Ma vale solo per un chip che DQ5 lo implementa davvero: su
+ * uno che non lo fa, o che non capisce affatto i nostri comandi e resta
+ * in lettura, il byte letto puo' non coincidere mai con quello atteso e
+ * avere il bit 5 a zero, e si girerebbe per sempre. Il contatore e' la
+ * seconda rete dietro DQ5.
  *
  * Ogni giro del ciclo contiene una lettura dalla cartuccia, che con
- * WAITCNT a 3 costa 8 cicli, piu' confronto e salto: una quindicina di
- * cicli in tutto. A 16.777.216 Hz fanno circa un milione di giri al
- * secondo.
+ * WAITCNT a 3 costa 8 cicli, piu' chiamata, confronto e salto. La stima
+ * qui sotto - circa un milione di giri al secondo - e' per difetto: il
+ * giro vero e' piu' lento, quindi i tetti reali sono piu' larghi.
  *
- * I valori sono volutamente larghi. Un tetto che scatta su un chip sano
- * e' peggio del problema che risolve: interromperebbe una cancellazione
- * a meta'. Un erase di blocco Intel puo' arrivare a qualche secondo nei
- * casi peggiori, un program di un byte sta sotto il millisecondo. */
+ * Un tetto che scatta su un chip sano e' peggio del problema che risolve:
+ * interromperebbe una cancellazione a meta'. */
 #define FLASH_LOOPS_PER_SECOND 1048576UL
-#define FLASH_TIMEOUT_ERASE    (8UL * FLASH_LOOPS_PER_SECOND)    /* ~8 s   */
-#define FLASH_TIMEOUT_PROGRAM  (FLASH_LOOPS_PER_SECOND / 20UL)   /* ~50 ms */
+/* I tetti sono quelli delle tabelle maxTime delle librerie Nintendo,
+ * espressi nei loro tick: timer a 256 cicli con ricarica 65469, cioe' un
+ * tick ogni ~1 ms. Qui il tempo si conta in giri del ciclo di attesa;
+ * eseguito dalla ROM il giro e' piu' lento della stima, quindi il tetto
+ * reale e' uguale o piu' largo di quello Nintendo, mai piu' stretto. */
+#define FLASH_TICKS(n)          ((unsigned long) (n) * (FLASH_LOOPS_PER_SECOND / 1000UL))
+#define FLASH_TIMEOUT_PROGRAM   FLASH_TICKS(10)     /* tutti i chip       */
+#define FLASH_TIMEOUT_ERASE_2000 FLASH_TICKS(2000)  /* Macronix, Sanyo    */
+#define FLASH_TIMEOUT_ERASE_500  FLASH_TICKS(500)   /* Panasonic          */
+#define FLASH_TIMEOUT_ERASE_40   FLASH_TICKS(40)    /* SST e sconosciuti  */
+#define FLASH_TIMEOUT_PAGE      FLASH_TICKS(40)     /* pagina Atmel       */
 
-#define PROTO_AMD_JEDEC 0
-#define PROTO_INTEL_SHARP 1
-
-#define MFR_INTEL    0x89
-#define MFR_SHARP_A  0xB0
-#define MFR_SHARP_B  0x05
+#define REG_IME (*(volatile unsigned short *) 0x04000208)
 
 /* Wait state dell'area di salvataggio.
  *
@@ -160,291 +232,479 @@ static struct eeprom_meta *get_eeprom_meta(void)
  * protegge anche gli accessi che il gioco facesse per conto suo. */
 #define REG_WAITCNT (*(volatile unsigned short *) 0x04000204)
 
+/* Letture dalla Flash eseguite dalla RAM, come nella libreria Nintendo.
+ *
+ * FLASH1M_V103 non legge mai la Flash da codice in ROM: SetReadFlash1
+ * copia la routine di lettura di un byte in un buffer sullo stack (IWRAM)
+ * e tutte le letture - attesa di fine operazione, identificazione,
+ * ReadFlash, VerifyFlashSector - passano da li'. Le scritture dei comandi
+ * restano in ROM. Si fa lo stesso: tre routine minime, scritte qui come
+ * codice macchina Thumb, vengono copiate in un buffer sullo stack della
+ * funzione d'ingresso e chiamate tramite puntatore.
+ *
+ *   rd1      ldrb r0,[r0] / bx lr                         lettura di un byte
+ *   rdcopy   (dst, flash, size, passo) copia Flash -> RAM  come ReadFlash_Core
+ *   rdverify (ram, flash, size, passo) -> byte rimasti     come VerifyFlashSector_Core
+ *
+ * Il buffer vive finche' e' viva la funzione che l'ha preparato; il suo
+ * indirizzo sta in una cella fissa in cima alla EWRAM, perche' il payload
+ * non ha variabili globali.
+ *
+ * La cella e' quella a SCRATCH_BUF_ADDR - 8, dove prima stava la cache
+ * del protocollo: e' memoria che il payload scriveva gia' in tutti i
+ * giochi provati. NON va messa a SCRATCH_BUF_ADDR - 12: li' coincide con
+ * i campi head, slot e pad di struct ej_ctrl (0x0203F7F4..F7), e ogni
+ * scrittura di c->head da parte del journal cambierebbe questo puntatore,
+ * mandando la lettura successiva a un indirizzo qualsiasi. */
+#define RAMCODE_PTR (*(volatile unsigned *) (SCRATCH_BUF_ADDR - 8))
+#define RAMCODE_HALFWORDS 27
+#define RAMCODE_OFF_RD1      0
+#define RAMCODE_OFF_RDCOPY   4
+#define RAMCODE_OFF_RDVERIFY 0x1A
+
+static void flashRamSetup(volatile unsigned short *buf)
+{
+    buf[0]  = 0x7800; buf[1]  = 0x4770;                         /* rd1 */
+    buf[2]  = 0xB410; buf[3]  = 0x2A00; buf[4]  = 0xD005;       /* rdcopy */
+    buf[5]  = 0x780C; buf[6]  = 0x7004; buf[7]  = 0x3001;
+    buf[8]  = 0x18C9; buf[9]  = 0x3A01; buf[10] = 0xE7F7;
+    buf[11] = 0xBC10; buf[12] = 0x4770;
+    buf[13] = 0xB430; buf[14] = 0x2A00; buf[15] = 0xD007;       /* rdverify */
+    buf[16] = 0x7804; buf[17] = 0x780D; buf[18] = 0x42AC;
+    buf[19] = 0xD103; buf[20] = 0x3001; buf[21] = 0x18C9;
+    buf[22] = 0x3A01; buf[23] = 0xE7F5; buf[24] = 0x0010;
+    buf[25] = 0xBC30; buf[26] = 0x4770;
+    RAMCODE_PTR = (unsigned) buf;
+}
+
+typedef unsigned char (*rd1_fn)(volatile unsigned char *);
+typedef void (*rdcopy_fn)(volatile unsigned char *, volatile unsigned char *, unsigned, unsigned);
+typedef unsigned (*rdverify_fn)(volatile unsigned char *, volatile unsigned char *, unsigned, unsigned);
+
+static unsigned char frd(volatile unsigned char *p)
+{
+    return ((rd1_fn) (RAMCODE_PTR + RAMCODE_OFF_RD1 + 1))(p);
+}
+
+static void fcopy(volatile unsigned char *dst, volatile unsigned char *flash, unsigned size, unsigned stride)
+{
+    ((rdcopy_fn) (RAMCODE_PTR + RAMCODE_OFF_RDCOPY + 1))(dst, flash, size, stride);
+}
+
+static unsigned fverify(volatile unsigned char *ram, volatile unsigned char *flash, unsigned size, unsigned stride)
+{
+    return ((rdverify_fn) (RAMCODE_PTR + RAMCODE_OFF_RDVERIFY + 1))(ram, flash, size, stride);
+}
+
 static void flashSetWaitState(void)
 {
     REG_WAITCNT = (unsigned short) ((REG_WAITCNT & 0xFFFC) | 3);
 }
 
-static int detect_flash_type(void)
+/* Wait state del chip per la durata di una cancellazione o di un program.
+ * Chi la chiama rimette 3 con flashSetWaitState appena l'attesa e' finita,
+ * come fanno le routine della libreria. */
+static void flashSetWriteWait(int chip)
 {
-    flashSetWaitState();
+    REG_WAITCNT = (unsigned short) ((REG_WAITCNT & 0xFFFC) | (chip & CF_WAIT_MASK));
+}
 
-    /* I due byte prima del comando di identificazione. Se dopo il
-     * comando non e' cambiato nessuno dei due, il chip non e' entrato in
-     * quella modalita' - capita sulle cartucce economiche che non la
-     * implementano - e quello che leggeremmo sarebbe un dato qualsiasi,
-     * non un identificativo. Guardarne due invece di uno rende la
-     * coincidenza praticamente impossibile, e in caso di dubbio si
-     * ricade su AMD, che e' il verso sicuro. */
-    unsigned char before_mfr = SRAM_BASE[0x0000];
-    unsigned char before_dev = SRAM_BASE[0x0001];
-
-    SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
-    SRAM_BASE[FLASH_MAGIC_1] = 0x55;
-    SRAM_BASE[FLASH_MAGIC_0] = 0x90;
-    __asm("nop");
-    unsigned char m_id = SRAM_BASE[0x0000];
-    unsigned char d_id = SRAM_BASE[0x0001];
-
-    /* Due reset, sempre, prima di qualsiasi uscita.
-     *
-     * 0x90 e' il comando di identificazione di entrambe le famiglie, ma si
-     * esce in due modi diversi: 0xF0 su AMD, 0xFF su Intel. Mandarne uno
-     * solo lascia scoperto il caso del chip che HA risposto a 0x90 ma il
-     * cui codice costruttore non e' fra i tre riconosciuti: si esce dal
-     * fondo, come AMD, con il chip ancora in modalita' identificazione.
-     * Da li' in poi ogni lettura della finestra restituisce i byte di
-     * identificazione invece dei dati - il payload li copierebbe nel
-     * buffer del gioco e, peggio, li riprogrammerebbe nella Flash dopo
-     * una cancellazione.
-     *
-     * Il reset AMD va mandato nella forma a TRE CICLI, preceduto dalla
-     * sequenza di sblocco. Su silicio vero basterebbe la scrittura
-     * singola di 0xF0 - il datasheet la ammette da qualunque stato - ma
-     * non tutte le implementazioni la riconoscono: mGBA, per dirne una,
-     * accetta 0xF0 soltanto dopo 0xAA e 0x55 e all'indirizzo di sblocco,
-     * e con la scrittura singola il chip resta in identificazione per
-     * sempre. La forma a tre cicli e' valida anche sui chip veri, quindi
-     * non si perde niente a usarla.
-     *
-     * Il 0xFF di Intel resta una scrittura singola, che per quella
-     * famiglia e' la forma giusta. Mandarli entrambi non costa niente:
-     * ciascuno dei due e' privo di significato per l'altra famiglia. */
+/* Reset nella forma a tre cicli all'indirizzo di sblocco. Nintendo scrive
+ * il solo 0xF0 a 0x5555, e su silicio vero basterebbe; qui lo si fa
+ * precedere da 0xAA/0x55 perche' non tutte le implementazioni accettano
+ * la scrittura singola - mGBA, per dirne una, riconosce 0xF0 soltanto
+ * dopo la sequenza di sblocco. La forma a tre cicli e' valida anche sui
+ * chip veri, quindi non si perde niente a usarla. */
+static void flashResetAmd(void)
+{
     SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
     SRAM_BASE[FLASH_MAGIC_1] = 0x55;
     SRAM_BASE[FLASH_MAGIC_0] = 0xF0;
     __asm("nop");
-    SRAM_BASE[0x0000] = 0xFF;
-    __asm("nop");
+}
+
+/* Ritardo come quello della libreria Nintendo: un contatore volatile a
+ * 16 bit da 20000 (0x4E20) decrementato in un ciclo, circa 20 ms. Nintendo
+ * lo usa dopo il comando di identificazione 0x90, prima di leggere i due
+ * byte, e di nuovo dopo l'uscita con 0xF0. */
+static void flashDelayId(void)
+{
+    volatile unsigned short n = 20000;
+    while (n)
+        n = n - 1;
+}
+
+/* Identificazione, come ReadFlashId: 0x90, attesa, lettura dei due codici,
+ * uscita con 0xF0, attesa. Lo 0xF0 e' scritto due volte come in
+ * FLASH1M_V103 (FLASH_V123 lo scrive una volta sola): la seconda scrittura
+ * e' innocua per tutti e serve ai chip di quella libreria.
+ *
+ * I due byte letti PRIMA del comando servono a riconoscere il chip che in
+ * modalita' identificazione non ci entra affatto: se dopo il comando non
+ * e' cambiato nessuno dei due, quello che si legge e' il salvataggio e non
+ * un codice, e prenderlo per buono potrebbe far scegliere la routine
+ * Atmel su un chip che Atmel non e'. In quel caso il chip e' sconosciuto. */
+static int detect_flash_chip(void)
+{
+    unsigned char before_mfr = frd(&SRAM_BASE[0x0000]);
+    unsigned char before_dev = frd(&SRAM_BASE[0x0001]);
+
+    SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
+    SRAM_BASE[FLASH_MAGIC_1] = 0x55;
+    SRAM_BASE[FLASH_MAGIC_0] = 0x90;
+    flashDelayId();
+    unsigned char m_id = frd(&SRAM_BASE[0x0000]);
+    unsigned char d_id = frd(&SRAM_BASE[0x0001]);
+
+    SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
+    SRAM_BASE[FLASH_MAGIC_1] = 0x55;
+    SRAM_BASE[FLASH_MAGIC_0] = 0xF0;
+    SRAM_BASE[FLASH_MAGIC_0] = 0xF0;   /* Nintendo lo scrive due volte */
+    flashDelayId();
 
     if (m_id == before_mfr && d_id == before_dev)
-        return PROTO_AMD_JEDEC;
+        return CHIP_UNKNOWN;
 
-    if (m_id == MFR_INTEL || m_id == MFR_SHARP_A || m_id == MFR_SHARP_B)
-        return PROTO_INTEL_SHARP;
+    /* Sempre con il codice esatto, costruttore e dispositivo. Vale
+     * soprattutto per Atmel: la scrittura a pagine su un chip che non la
+     * capisce non scrive niente di buono. */
+    if (m_id == 0xC2 && (d_id == 0x1C || d_id == 0x09))
+        return CHIP_MACRONIX;
+    if (m_id == 0x32 && d_id == 0x1B)
+        return CHIP_PANASONIC;
+    if (m_id == 0x62 && d_id == 0x13)
+        return CHIP_SANYO;
+    if (m_id == 0xBF && d_id == 0xD4)
+        return CHIP_SST;
+    if (m_id == 0xBF && d_id >= 0xD5 && d_id <= 0xD7)
+        return CHIP_SST39;
+    if (m_id == 0x1F && d_id == 0x3D)
+        return CHIP_ATMEL;
 
-    return PROTO_AMD_JEDEC;
+    return CHIP_UNKNOWN;
 }
 
-#define FLASH_PROTO_CACHE (*(volatile unsigned *) (SCRATCH_BUF_ADDR - 8))
-#define FLASH_PROTO_MAGIC (0x50524FU)
+/* Il descrittore si ricorda in una cella in cima alla EWRAM, cosi'
+ * l'identificazione - due attese da 20 ms - si paga una volta sola. Se il
+ * gioco ci scrive sopra la firma non combacia e si identifica di nuovo. */
+#define FLASH_CHIP_CACHE (*(volatile unsigned *) (SCRATCH_BUF_ADDR - 4))
+#define FLASH_CHIP_MAGIC (0x464C43U)
 
-static int flash_protocol(void)
+static int flash_chip(void)
 {
-    unsigned cached = FLASH_PROTO_CACHE;
-    if ((cached >> 8) == FLASH_PROTO_MAGIC)
-    {
-        unsigned p = cached & 0xFF;
-        if (p == PROTO_AMD_JEDEC || p == PROTO_INTEL_SHARP)
-            return (int) p;
-    }
-    int p = detect_flash_type();
-    FLASH_PROTO_CACHE = (FLASH_PROTO_MAGIC << 8) | (unsigned) p;
-    return p;
+    unsigned cached = FLASH_CHIP_CACHE;
+    if ((cached >> 8) == FLASH_CHIP_MAGIC)
+        return (int) (cached & 0xFF);
+    int c = detect_flash_chip();
+    FLASH_CHIP_CACHE = (FLASH_CHIP_MAGIC << 8) | (unsigned) c;
+    return c;
 }
 
-static int flashWaitData(volatile unsigned char *tgt, unsigned char expected, int protocol)
+/* Attesa di fine operazione: si rilegge la cella finche' restituisce il
+ * byte atteso. Finche' il chip lavora, il bit 7 e' il complemento del
+ * dato, quindi il byte non puo' coincidere; quando coincide l'operazione
+ * e' finita e il dato e' gia' quello giusto.
+ *
+ * Con status_bits (Macronix e Sanyo) e' WaitForFlashWrite_Common di
+ * FLASH1M_V103: si esce anche quando il chip alza il bit 5, e se dopo una
+ * rilettura il dato non coincide si manda il reset all'indirizzo di
+ * sblocco.
+ *
+ * Senza (tutti gli altri) e' l'attesa di FLASH_V123: conta solo il tempo
+ * e non si manda nessun reset. Il bit 5 non si guarda perche' su quei
+ * chip non e' detto che sia un bit di stato, e potrebbe valere 1 a
+ * operazione ancora in corso. */
+static int flashWaitData(volatile unsigned char *tgt, unsigned char expected,
+                         unsigned long budget, int status_bits)
 {
-    /* expected vale 0xFF solo per l'erase: un program con dato 0xFF non
-     * arriva mai qui, perche' nel ramo senza cancellazione un byte 0xFF
-     * implica che la cella sia gia' 0xFF e venga saltata, e nel ramo con
-     * cancellazione i 0xFF si saltano per definizione. */
-    unsigned long budget = (expected == 0xFF) ? FLASH_TIMEOUT_ERASE
-                                              : FLASH_TIMEOUT_PROGRAM;
-
-    if (protocol == PROTO_INTEL_SHARP) {
-        volatile unsigned char sr;
-        unsigned char error_mask = (expected == 0xFF) ? 0x20 : 0x10;
-        do {
-            sr = *tgt;
-            if (sr & 0x80) {
-                if (sr & error_mask) {
-                    *tgt = 0x50;
-                    *tgt = 0xFF;
-                    return 0;
-                }
-                *tgt = 0xFF;
-                return 1;
-            }
-            /* La condizione di uscita e' solo il contatore. Guardare qui
-             * i bit di errore sarebbe inutile: sono validi solo con
-             * SR.7 = 1, e con SR.7 = 1 siamo gia' usciti dall'if sopra. */
-        } while (--budget);
-        *tgt = 0x50;
-        *tgt = 0xFF;
-        return 0;
-    }
-
-    unsigned char value = expected & 0x80;
     volatile unsigned char a;
-    /* DQ5 resta la condizione principale: se il chip lo implementa si esce
-     * di li' senza consumare il contatore, che interviene solo quando DQ5
-     * non arriva mai. In entrambi i casi si ricontrolla DQ7 una volta prima
-     * di dichiarare il fallimento, perche' l'operazione potrebbe essere
-     * terminata proprio nel giro in cui siamo usciti. */
-    do {
-        a = *tgt;
-        if ((a & 0x80) == value)
+    for (;;) {
+        a = frd(tgt);
+        if (a == expected)
             return 1;
-    } while (!(a & 0x20) && --budget);
-    if ((*tgt & 0x80) == value)
-        return 1;
-    *tgt = 0xF0;
-    __asm("nop");
-    return 0;
+        if ((status_bits && (a & 0x20)) || !--budget) {
+            if (frd(tgt) == expected)
+                return 1;
+            if (status_bits)
+                flashResetAmd();
+            return 0;
+        }
+    }
+}
+
+/* Un comando di cancellazione del settore e la sua attesa, con il wait
+ * state e il tetto del chip. */
+static int flashEraseOnce(volatile unsigned char *tgt, int chip)
+{
+    unsigned long budget = FLASH_TIMEOUT_ERASE_40;
+    if ((chip & CF_ERASE_MASK) == CF_ERASE_500)
+        budget = FLASH_TIMEOUT_ERASE_500;
+    if ((chip & CF_ERASE_MASK) == CF_ERASE_2000)
+        budget = FLASH_TIMEOUT_ERASE_2000;
+
+    flashSetWriteWait(chip);
+    SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
+    SRAM_BASE[FLASH_MAGIC_1] = 0x55;
+    SRAM_BASE[FLASH_MAGIC_0] = 0x80;
+    SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
+    SRAM_BASE[FLASH_MAGIC_1] = 0x55;
+    *tgt = 0x30;
+    int ok = flashWaitData(tgt, 0xFF, budget, chip & CF_STATUS);
+    flashSetWaitState();
+    return ok;
+}
+
+/* Tutti i 4096 byte fisici del settore a 0xFF? E' il controllo che la
+ * routine SST di Nintendo esegue dalla RAM dopo ogni cancellazione. */
+static int flashSectorBlank(volatile unsigned char *sector)
+{
+    for (unsigned i = 0; i < 0x1000; ++i)
+        if (frd(&sector[i]) != 0xFF)
+            return 0;
+    return 1;
 }
 
 /* flashEraseSector e flashProgramByte restituiscono 1 se l'operazione e'
- * andata a buon fine, 0 se tutti i tentativi sono falliti.
+ * andata a buon fine, 0 se e' fallita. Alla prima operazione fallita il
+ * chiamante ferma tutta la scrittura: dopo una cancellazione fallita il
+ * settore e' a meta', e su un chip che non risponde proseguire
+ * moltiplicherebbe i tetti di attesa per il numero di byte.
  *
- * Prima erano void e il chiamante proseguiva comunque. Due conseguenze:
- * dopo una cancellazione fallita il settore resta cancellato a meta' e la
- * riprogrammazione ci scriveva sopra, producendo 'vecchio AND nuovo' -
- * cioe' il blocco misto che nel ripiego di can_buffer abbiamo deciso di
- * non produrre mai; e su un chip che non risponde i tetti di attesa si
- * moltiplicano per il numero di byte (3 tentativi da 50 ms per ognuno dei
- * 32768 byte fanno piu' di un'ora). Alla prima operazione fallita conviene
- * fermare tutta la scrittura: il blocco e' gia' perso, insistere lo rovina
- * di piu' e basta. */
-static int flashEraseSector(volatile unsigned char *tgt, int protocol)
+ * Non vanno chiamate su un Atmel, che non ha ne' cancellazione ne' program
+ * del singolo byte: i chiamanti lo deviano prima. */
+static int flashEraseSector(volatile unsigned char *tgt, int chip)
 {
-    for (int attempt = 0; attempt < FLASH_MAX_ATTEMPTS; ++attempt)
+    if (!(chip & CF_VERIFY))
     {
-        if (protocol == PROTO_AMD_JEDEC) {
-            SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
-            SRAM_BASE[FLASH_MAGIC_1] = 0x55;
-            SRAM_BASE[FLASH_MAGIC_0] = 0x80;
-            SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
-            SRAM_BASE[FLASH_MAGIC_1] = 0x55;
-            *tgt = 0x30;
-        } else {
-            *tgt = 0x20;
-            *tgt = 0xD0;
-        }
-        __asm("nop");
-        int settled = flashWaitData(tgt, 0xFF, protocol);
-        if (settled)
-        {
-            if (*tgt == 0xFF)
+        /* Macronix, Sanyo, Panasonic, SST 39xF0x0: si cancella e ci si fida
+         * dell'attesa. Cinque tentativi dove c'e' il bit di stato a dire
+         * che e' fallita, uno solo altrimenti. */
+        int attempts = (chip & CF_STATUS) ? FLASH_ERASE_ATTEMPTS : 1;
+        while (attempts--)
+            if (flashEraseOnce(tgt, chip))
                 return 1;
-            *tgt = (protocol == PROTO_AMD_JEDEC) ? 0xF0 : 0xFF;
-            __asm("nop");
-        }
+        return 0;
     }
-    return 0;
+
+    /* SST e sconosciuti. Senza bit di stato e con un tetto cosi' corto
+     * l'unica prova che la cancellazione sia riuscita e' rileggere il
+     * settore, quindi si cancella e si controlla finche' non risulta
+     * vuoto. */
+    volatile unsigned char *sector =
+        (volatile unsigned char *) ((unsigned) tgt & ~0xFFFu);
+    unsigned tries = 0;
+    while (!flashEraseOnce(tgt, chip) || !flashSectorBlank(sector))
+        if (++tries == FLASH_B_ERASE_GIVEUP)
+            return 0;
+
+    /* Cancellazioni di margine: il settore risulta vuoto, ma con un tetto
+     * cosi' corto le celle potrebbero essere appena oltre la soglia. Come
+     * in Nintendo l'esito di queste non decide niente.
+     *
+     * Una cosa in piu' rispetto a Nintendo: se una di queste scade, si
+     * aspetta comunque che il chip finisca, con il tetto lungo. Su un SST
+     * non capita mai. Capita su un chip sconosciuto piu' lento dei 40
+     * tick, e senza questa attesa i program successivi partirebbero a
+     * cancellazione ancora in corso e fallirebbero tutti. */
+    for (unsigned n = tries ? FLASH_B_MARGIN_RETRIED : FLASH_B_MARGIN_CLEAN; n; --n)
+        if (!flashEraseOnce(tgt, chip))
+            (void) flashWaitData(tgt, 0xFF, FLASH_TIMEOUT_ERASE_2000, 0);
+    return 1;
 }
 
-static int flashProgramByte(volatile unsigned char *tgt, unsigned char data, int protocol)
+static int flashProgramByte(volatile unsigned char *tgt, unsigned char data, int chip)
 {
-    for (int attempt = 0; attempt < FLASH_MAX_ATTEMPTS; ++attempt)
-    {
-        if (protocol == PROTO_AMD_JEDEC) {
-            SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
-            SRAM_BASE[FLASH_MAGIC_1] = 0x55;
-            SRAM_BASE[FLASH_MAGIC_0] = 0xA0;
-            *tgt = data;
-        } else {
-            *tgt = 0x40;
-            *tgt = data;
-        }
-        __asm("nop");
-        int settled = flashWaitData(tgt, data, protocol);
-        if (settled)
-        {
-            if (*tgt == data)
-                return 1;
-            *tgt = (protocol == PROTO_AMD_JEDEC) ? 0xF0 : 0xFF;
-            __asm("nop");
-        }
-    }
-    return 0;
+    /* ProgramByte: sequenza di program e attesa del dato, un solo
+     * tentativo. Se fallisce, la scrittura si ferma. */
+    flashSetWriteWait(chip);
+    SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
+    SRAM_BASE[FLASH_MAGIC_1] = 0x55;
+    SRAM_BASE[FLASH_MAGIC_0] = 0xA0;
+    *tgt = data;
+    int ok = flashWaitData(tgt, data, FLASH_TIMEOUT_PROGRAM, chip & CF_STATUS);
+    flashSetWaitState();
+    return ok;
 }
-int my_memcpy(volatile unsigned char *dst, int dstride, volatile unsigned char *src, int sstride, unsigned size)
+
+/* Copia da RAM a RAM: le letture dalla Flash passano tutte da fcopy. Il
+ * vecchio conteggio dei byte diversi non lo leggeva nessuno, e costava una
+ * lettura in piu' di ciascuno dei due puntatori. */
+static void my_memcpy(volatile unsigned char *dst, int dstride, volatile unsigned char *src, int sstride, unsigned size)
 {
-    int hits = 0;
     while (size)
     {
-        if (*dst != *src)
-            ++hits;
         *dst = *src;
         dst += dstride;
         src += sstride;
         --size;
     }
-    return hits;
 }
 
 /* Il puntatore e' volatile: la finestra della cartuccia non e' memoria
  * normale, e le letture non vanno accorpate ne' spostate rispetto alle
  * scritture dei comandi. */
-volatile unsigned char *translate(unsigned idx, int loadfactor_log2)
+static volatile unsigned char *translate(unsigned idx, int loadfactor_log2)
 {
     return (volatile unsigned char *) (0x0E000000 | idx << loadfactor_log2);
 }
 
+/* ================================================================
+ * Atmel AT29LV512: scrittura a pagine
+ * ================================================================
+ *
+ * Questo chip non ha un comando di cancellazione del settore ne' un
+ * program del singolo byte. Si manda lo sblocco con 0xA0 e poi i 128 byte
+ * di una pagina uno dopo l'altro; quando il caricamento si ferma il chip
+ * cancella la pagina e la riscrive da se'. I byte non caricati
+ * resterebbero a 0xFF, quindi la pagina va sempre mandata intera.
+ *
+ * Come nelle routine Atmel di FLASH_V123:
+ *  - gli interrupt sono spenti durante il caricamento: il chip considera
+ *    finita la pagina se passano piu' di 150 us fra un byte e l'altro, e
+ *    un interrupt del gioco in mezzo la farebbe partire a meta';
+ *  - si attende sull'ULTIMO byte caricato, che durante la scrittura
+ *    restituisce il bit 7 invertito;
+ *  - tre tentativi per pagina.
+ * In piu' rispetto a Nintendo, a scrittura finita la pagina viene
+ * riletta e confrontata per intero. */
+static int atmelWritePage(volatile unsigned char *page, const unsigned char *buf)
+{
+    for (int attempt = 0; attempt < ATMEL_PAGE_ATTEMPTS; ++attempt)
+    {
+        unsigned short ime = REG_IME;
+        REG_IME = 0;
+        SRAM_BASE[FLASH_MAGIC_0] = 0xAA;
+        SRAM_BASE[FLASH_MAGIC_1] = 0x55;
+        SRAM_BASE[FLASH_MAGIC_0] = 0xA0;
+        for (unsigned i = 0; i < ATMEL_PAGE; ++i)
+            page[i] = buf[i];
+        REG_IME = ime;
+
+        if (flashWaitData(&page[ATMEL_PAGE - 1], buf[ATMEL_PAGE - 1], FLASH_TIMEOUT_PAGE, 0)
+            && !fverify((volatile unsigned char *) buf, page, ATMEL_PAGE, 1))
+            return 1;
+    }
+    return 0;
+}
+
+/* Scrive size byte logici a partire da idx, con il passo 1 << lf, una
+ * pagina fisica per volta: la si legge, si sostituiscono i byte che
+ * cambiano e, solo se qualcosa e' cambiato davvero, la si riscrive.
+ *
+ * Non c'e' decisione sulla cancellazione e non serve il buffer da 2 KB:
+ * bastano i 128 byte della pagina, sullo stack. Restituisce 1 se tutte le
+ * pagine sono andate a buon fine.
+ *
+ * noinline di proposito: se il compilatore la fondesse nei chiamanti, quei
+ * 128 byte finirebbero nel loro stack anche sugli altri chip, che e' lo
+ * stack del gioco. */
+__attribute__((noinline))
+static int atmel_write(const unsigned char *src, unsigned idx, unsigned size, int loadfactor_log2)
+{
+    unsigned char buf[ATMEL_PAGE];
+    unsigned step = 1u << loadfactor_log2;
+
+    while (size)
+    {
+        unsigned phys = (idx << loadfactor_log2) & 0xFFFFu;
+        unsigned off = phys & (ATMEL_PAGE - 1);
+        volatile unsigned char *page =
+            (volatile unsigned char *) (0x0E000000 | (phys - off));
+        int changed = 0;
+
+        fcopy(buf, page, ATMEL_PAGE, 1);
+        while (off < ATMEL_PAGE && size)
+        {
+            if (buf[off] != *src)
+            {
+                buf[off] = *src;
+                changed = 1;
+            }
+            ++src;
+            ++idx;
+            --size;
+            off += step;
+        }
+        if (changed && !atmelWritePage(page, buf))
+            return 0;
+    }
+    return 1;
+}
+
+/* EEPROM su Atmel: niente journal.
+ *
+ * Il journal vive di program in spazio vergine, senza cancellare, ed e'
+ * proprio cio' che questo chip non sa fare: ogni scrittura riscrive la
+ * pagina intera, quindi un record in coda costerebbe quanto riscrivere il
+ * blocco al suo posto, e una interruzione rovinerebbe anche i record
+ * vicini. Qui i blocchi si scrivono direttamente, e non serve altro: la
+ * pagina da 128 byte e' gia' un'unita' di cancellazione piccola.
+ *
+ * Il passo e' sempre 3, per entrambe le misure di EEPROM: un blocco da 8
+ * byte occupa 64 byte fisici e sta dentro una pagina sola, quindi una
+ * scrittura di blocco e' una scrittura di pagina, e ogni pagina ospita
+ * due blocchi soltanto. Con il passo 7 delle EEPROM da 4 Kbit un blocco
+ * si spargerebbe su otto pagine. Non c'e' un formato precedente da
+ * rispettare: prima di questa versione il payload su Atmel non scriveva. */
+#define ATMEL_EEPROM_LF     3
+#define ATMEL_EEPROM_BLOCKS 1024u
+
+static int atmel_eeprom_write(unsigned addr, const unsigned char *src)
+{
+    if (addr >= ATMEL_EEPROM_BLOCKS)
+        return 0;
+    return atmel_write(src, addr << 3, 8, ATMEL_EEPROM_LF);
+}
+
+static int atmel_eeprom_read(unsigned addr, unsigned char *dst)
+{
+    if (addr >= ATMEL_EEPROM_BLOCKS)
+        return 0;
+    fcopy(dst, translate(addr << 3, ATMEL_EEPROM_LF), 8, 1u << ATMEL_EEPROM_LF);
+    return 1;
+}
+
+static int atmel_eeprom_verify(unsigned addr, unsigned char *src)
+{
+    if (addr >= ATMEL_EEPROM_BLOCKS)
+        return 0;
+    return !fverify(src, translate(addr << 3, ATMEL_EEPROM_LF), 8, 1u << ATMEL_EEPROM_LF);
+}
+
 void write_core_patched(unsigned char *src, unsigned idx, unsigned size, int loadfactor_log2)
 {
+    volatile unsigned short ramcode[RAMCODE_HALFWORDS];
+    flashRamSetup(ramcode);
     flashSetWaitState();
-    int protocol = flash_protocol();
+    int chip = flash_chip();
+    if (chip & CF_ATMEL)
+    {
+        /* Percorso a pagine, del tutto separato da quello qui sotto. */
+        (void) atmel_write(src, idx, size, loadfactor_log2);
+        return;
+    }
     /* Dimensione in byte dell'unita' di cancellazione del chip. E' l'unica
      * assunzione che, se sbagliata, provoca perdita di dati invece che
      * lentezza: cancelleremmo piu' di quanto poi ripristiniamo.
      *
-     * VERIFICATO: le cartucce repro montano tutte chip AMD/JEDEC con
-     * settori da 4KB. L'unica eccezione nota sono gli Atmel originali,
-     * che lavorano a pagine da 128 byte, e quelli sulle repro non
-     * compaiono. Non serve quindi ricavare la dimensione da un
-     * identificativo.
+     * Tutti i chip che passano di qui lavorano a settori da 4 KB: e' la
+     * geometria di tutti i chip che riconosciamo, Atmel escluso, ed e'
+     * quella che la libreria Nintendo assume anche per i chip sconosciuti.
      *
-     * Se un giorno saltasse fuori un Atmel non basterebbe cambiare
-     * questo numero: quella famiglia ha un modello di scrittura diverso
-     * - si scrive una pagina intera e la cancellazione avviene da se' -
-     * quindi servirebbe un secondo percorso di codice, non una voce di
-     * tabella.
+     * loadfactor_log2 non vale mai 0 - da qui passa solo la SRAM, con 1 -
+     * quindi sector_usage vale al massimo 2048, cioe' SCRATCH_BUF_SIZE: il
+     * buffer copre sempre l'intero settore da 4 KB. Con 0 servirebbe il
+     * doppio e si sborderebbe oltre la cima della EWRAM.
      *
-     * I chip Intel/Sharp cancellano a blocchi da 64KB. Il ciclo qui sotto
-     * resta lo stesso: cambiano solo l'unita' e il buffer, e con un'unita'
-     * da 64KB il ciclo fa sempre un giro solo, perche' un blocco copre
-     * gia' tutta l'area di salvataggio. */
-    /* Con segno, perche' viene confrontato con len e con prefix, che con
+     * Con segno, perche' viene confrontato con len e con prefix, che con
      * segno lo sono: un confronto misto fra int e unsigned promuove l'int
-     * a unsigned, e un valore negativo diventerebbe enorme. Qui non puo'
-     * succedere - i valori vanno da 512 a 65536 - ma il confronto misto e'
-     * proprio il modo in cui questi errori passano inosservati. */
-    int sector_usage;
-    unsigned char *sector_buf;
-    if (protocol == PROTO_INTEL_SHARP)
-    {
-        /* Ancorato in cima alla EWRAM e lungo esattamente quanto serve:
-         * con loadfactor_log2 3 o 7 si toccano 8 KB o 512 byte invece di
-         * 32, e sono comunque i byte piu' alti, i meno esposti.
-         *
-         * Qui l'unita' di cancellazione e' l'intera area di salvataggio,
-         * quindi ogni chiamata che richiede la cancellazione riscrive
-         * tutta l'area invece di un settore. Per la SRAM va bene, perche'
-         * i giochi scrivono il salvataggio in una o poche chiamate
-         * grandi. Sarebbe insostenibile per le EEPROM, che scrivono 8
-         * byte per volta - ma quelle non passano piu' da questa funzione:
-         * hanno il loro percorso a journal. */
-        sector_usage = 0x10000 >> loadfactor_log2;
-        sector_buf   = (unsigned char *) (EWRAM_END - sector_usage);
-    }
-    else
-    {
-        /* loadfactor_log2 non vale mai 0 - i chiamanti passano 1, 3 o 7 -
-         * quindi questo vale al massimo 2048, cioe' SCRATCH_BUF_SIZE: il
-         * buffer AMD copre sempre l'intero settore da 4 KB. Con 0 servirebbe
-         * il doppio e si sborderebbe oltre la cima della EWRAM. */
-        sector_usage = 0x1000 >> loadfactor_log2;
-        sector_buf   = (unsigned char *) SCRATCH_BUF_ADDR;
-    }
+     * a unsigned, e un valore negativo diventerebbe enorme. */
+    int sector_usage = 0x1000 >> loadfactor_log2;
+    unsigned char *sector_buf = (unsigned char *) SCRATCH_BUF_ADDR;
 
-    /* I dati che il gioco ci passa possono trovarsi dentro il buffer.
-     * Riguarda in pratica il solo percorso Intel, dove il buffer arriva a
-     * 32 KB di EWRAM e lo spazio di lavoro del gioco puo' caderci dentro;
-     * sui 2 KB in cima usati da AMD non e' successo in nessuno dei giochi
-     * provati, e finche' e' cosi' questo controllo e' vero e il percorso
-     * AMD si comporta esattamente come prima.
+    /* I dati che il gioco ci passa possono trovarsi dentro il buffer. Sui
+     * 2 KB in cima alla EWRAM non e' successo in nessuno dei giochi
+     * provati, e finche' e' cosi' questo controllo e' sempre vero.
      *
      * Se le due aree si sovrapponessero, la copia della Flash nel buffer
      * distruggerebbe i dati di origine prima di averli letti, e nella
@@ -458,9 +718,7 @@ void write_core_patched(unsigned char *src, unsigned idx, unsigned size, int loa
 
     /* Alla prima operazione fallita si esce dal ciclo invece di proseguire
      * sui blocchi successivi: il chip non risponde piu' come dovrebbe, e
-     * insistere significa solo moltiplicare i tetti di attesa. Si esce con
-     * break e non con return perche' la cache del protocollo va comunque
-     * ripristinata in fondo alla funzione. */
+     * insistere significa solo moltiplicare i tetti di attesa. */
     int failed = 0;
 
     while (size)
@@ -473,10 +731,17 @@ void write_core_patched(unsigned char *src, unsigned idx, unsigned size, int loa
             len = sector_usage;
             len -= prefix;
         }
+        /* Il gioco scrive la SRAM a pezzi di qualunque misura (FE6 la
+         * azzera a blocchi da 64 byte), mentre ProgramFlashSector di
+         * Nintendo e' chiamata una volta per settore intero. Cancellare
+         * il settore a ogni chiamata vorrebbe dire centinaia di
+         * cancellazioni per un solo salvataggio. Si cancella quindi solo
+         * quando serve davvero, cioe' quando un bit deve tornare da 0 a 1;
+         * altrimenti si programmano direttamente i byte cambiati. */
         int need_erase = 0;
         for (int i = 0; i < len; ++i)
         {
-            unsigned char oldb = sector[(prefix + i) << loadfactor_log2];
+            unsigned char oldb = frd(&sector[(prefix + i) << loadfactor_log2]);
             unsigned char newb = src[i];
             if (oldb == newb)
                 continue;
@@ -488,14 +753,28 @@ void write_core_patched(unsigned char *src, unsigned idx, unsigned size, int loa
         }
         if (need_erase && can_buffer)
         {
-            my_memcpy(sector_buf, 1, sector, 1 << loadfactor_log2, sector_usage);
+            /* Come ProgramFlashSector - cancellazione del settore e
+             * program dei suoi byte - con una differenza: i byte che devono
+             * restare 0xFF non si programmano, si rileggono soltanto.
+             *
+             * Il program di 0xFF non cambia la cella; in Nintendo serve di
+             * fatto a controllare che la cancellazione l'abbia raggiunta,
+             * perche' l'attesa confronta il byte riletto con quello atteso.
+             * La rilettura da' lo stesso controllo con una lettura al posto
+             * di quattro scritture piu' l'attesa: se la cella non e' 0xFF
+             * la cancellazione non e' riuscita e ci si ferma, come avrebbe
+             * fatto il program. */
+            fcopy(sector_buf, sector, sector_usage, 1 << loadfactor_log2);
             my_memcpy(sector_buf + prefix, 1, src, 1, len);
-            if (!flashEraseSector(sector, protocol))
+            if (!flashEraseSector(sector, chip))
                 break;
             for (int i = 0; i < sector_usage; ++i)
             {
-                if (sector_buf[i] != 0xFF
-                    && !flashProgramByte(&sector[i << loadfactor_log2], sector_buf[i], protocol))
+                volatile unsigned char *cell = &sector[i << loadfactor_log2];
+                int ok = (sector_buf[i] == 0xFF)
+                       ? (frd(cell) == 0xFF)
+                       : flashProgramByte(cell, sector_buf[i], chip);
+                if (!ok)
                 {
                     failed = 1;
                     break;
@@ -506,35 +785,20 @@ void write_core_patched(unsigned char *src, unsigned idx, unsigned size, int loa
         }
         else if (need_erase)
         {
-            /* Serve la cancellazione ma il buffer non e' utilizzabile,
-             * perche' i dati di origine ci stanno dentro. Qui non si
-             * scrive niente, di proposito.
-             *
-             * Cancellare e riscrivere la sola finestra porterebbe via
-             * tutto il resto del blocco. Programmare i soli byte
-             * compatibili sarebbe peggio ancora: siamo in questo ramo
-             * proprio perche' almeno un byte richiede una transizione
-             * 0->1, quindi quel byte resterebbe vecchio e il blocco
-             * finirebbe misto - ne' il salvataggio nuovo ne' quello
-             * vecchio - con le programmazioni gia' fatte irreversibili.
-             *
-             * Non facendo nulla il vecchio salvataggio resta intero e
-             * coerente. La verifica del gioco fallisce e il giocatore
-             * vede che il salvataggio non riesce: un guasto visibile e
-             * senza danni collaterali.
-             *
-             * Gli altri blocchi della stessa chiamata non sono coinvolti:
-             * quelli che non richiedono cancellazione passano dal ramo
-             * sotto e vengono scritti normalmente. */
+            /* I dati di origine stanno dentro il buffer di lavoro:
+             * cancellare senza poter ricostruire il settore perderebbe il
+             * resto del blocco. Non si scrive niente; il vecchio
+             * salvataggio resta intero e la verifica del gioco segnala il
+             * fallimento. */
         }
         else
         {
             for (int i = 0; i < len; ++i)
             {
-                unsigned char oldb = sector[(prefix + i) << loadfactor_log2];
+                unsigned char oldb = frd(&sector[(prefix + i) << loadfactor_log2]);
                 unsigned char newb = src[i];
                 if (oldb != newb
-                    && !flashProgramByte(&sector[(prefix + i) << loadfactor_log2], newb, protocol))
+                    && !flashProgramByte(&sector[(prefix + i) << loadfactor_log2], newb, chip))
                 {
                     failed = 1;
                     break;
@@ -547,33 +811,26 @@ void write_core_patched(unsigned char *src, unsigned idx, unsigned size, int loa
         idx += len;
         size -= len;
     }
-
-    /* Su Intel il buffer copre anche gli 8 byte della cache del
-     * protocollo, che a questo punto sono stati sovrascritti: la
-     * riscriviamo, cosi' la chiamata successiva non deve ripetere la
-     * rilevazione. Non e' una questione di correttezza - senza cache si
-     * rileva di nuovo e basta - ma di tempo. */
-    if (protocol == PROTO_INTEL_SHARP)
-        FLASH_PROTO_CACHE = (FLASH_PROTO_MAGIC << 8) | (unsigned) protocol;
 }
 
 void read_core_patched(unsigned char *dst, unsigned idx, unsigned size, int loadfactor_log2)
 {
+    volatile unsigned short ramcode[RAMCODE_HALFWORDS];
+    flashRamSetup(ramcode);
     flashSetWaitState();
-    my_memcpy(dst, 1, translate(idx, loadfactor_log2), 1 << loadfactor_log2, size);
+    fcopy(dst, translate(idx, loadfactor_log2), size, 1 << loadfactor_log2);
 }
 
 int verify_core_patched(unsigned char *src, unsigned idx, unsigned size, int loadfactor_log2)
 {
+    volatile unsigned short ramcode[RAMCODE_HALFWORDS];
+    flashRamSetup(ramcode);
     flashSetWaitState();
-    while (size)
-    {
-        if (*src != *translate(idx, loadfactor_log2))
-            return idx;
-        ++src;
-        ++idx;
-        --size;
-    }
+    /* Il confronto gira in RAM come VerifyFlashSector_Core; restituisce
+     * quanti byte mancavano al primo diverso, 0 se coincidono tutti. */
+    unsigned left = fverify(src, translate(idx, loadfactor_log2), size, 1 << loadfactor_log2);
+    if (left)
+        return (int) (idx + (size - left));
     return -1;
 }
 
@@ -714,21 +971,20 @@ static int eeprom_loadfactor(struct eeprom_meta *m)
  * Mappa in EWRAM del journal (vale solo per i giochi EEPROM):
  *
  *   0x0203F800 .. 0x0203FFFF   indice, 1024 voci da 2 byte
- *   0x0203F7F8 .. 0x0203F7FF   cache del protocollo (gia' esistente)
+ *   0x0203F7FC .. 0x0203F7FF   cache del descrittore del chip
+ *   0x0203F7F8 .. 0x0203F7FB   indirizzo delle routine di lettura in RAM
  *   0x0203F7F0 .. 0x0203F7F7   controllo del journal, 8 byte
- *   0x0203D7F0 .. 0x0203F7EF   buffer temporaneo da 8 KB, SOLO su chip a
- *                              blocco unico e SOLO durante migrazione e
- *                              compattazione
  *
- * Su una cartuccia AMD il buffer temporaneo non serve: la migrazione usa
- * l'area dell'indice, che in quel momento non e' ancora valida. Quindi
- * l'occupazione permanente resta di 2064 byte, come prima del journal. */
+ * Su un Atmel il journal non si usa (vedi atmel_eeprom_write) e di questa
+ * mappa restano solo le due celle in alto.
+ *
+ * In tutto 2064 byte. La migrazione dal formato precedente ha bisogno di
+ * un appoggio temporaneo e usa l'area dell'indice, che in quel momento
+ * non e' ancora valida: non serve altra memoria. */
 
 #define EJ_CTRL_ADDR      (SCRATCH_BUF_ADDR - 16)
 #define EJ_INDEX_ADDR     (SCRATCH_BUF_ADDR)
 #define EJ_INDEX_LEN      (2048)
-#define EJ_TMP_INTEL_LEN  (8192)
-#define EJ_TMP_INTEL      (EJ_CTRL_ADDR - EJ_TMP_INTEL_LEN)
 
 struct ej_ctrl;
 
@@ -736,19 +992,19 @@ struct ej_ctrl;
  * e' proprio lo spazio liberato dall'interlacciamento a ospitarlo. */
 static unsigned char ej_rd(unsigned off)
 {
-    return *(volatile unsigned char *) (0x0E000000 | (off & 0xFFFF));
+    return frd((volatile unsigned char *) (0x0E000000 | (off & 0xFFFF)));
 }
 
 static int ej_pgm(unsigned off, const unsigned char *s, unsigned n)
 {
-    int protocol = flash_protocol();
+    int chip = flash_chip();
     for (unsigned i = 0; i < n; ++i)
     {
         volatile unsigned char *t =
             (volatile unsigned char *) (0x0E000000 | ((off + i) & 0xFFFF));
-        if (*t == s[i])
+        if (frd(t) == s[i])
             continue;                      /* gia' cosi': niente da fare */
-        if (!flashProgramByte(t, s[i], protocol))
+        if (!flashProgramByte(t, s[i], chip))
             return 0;
     }
     return 1;
@@ -758,12 +1014,7 @@ static int ej_erase(unsigned off)
 {
     return flashEraseSector(
         (volatile unsigned char *) (0x0E000000 | (off & 0xFFFF)),
-        flash_protocol());
-}
-
-static int ej_single_block(void)
-{
-    return flash_protocol() == PROTO_INTEL_SHARP;
+        flash_chip());
 }
 
 static struct ej_ctrl *ej_ctrl(void)
@@ -778,11 +1029,6 @@ static unsigned short *ej_index(void)
 
 static unsigned char *ej_tmp(unsigned *len)
 {
-    if (ej_single_block())
-    {
-        *len = EJ_TMP_INTEL_LEN;
-        return (unsigned char *) EJ_TMP_INTEL;
-    }
     *len = EJ_INDEX_LEN;
     return (unsigned char *) EJ_INDEX_ADDR;
 }
@@ -794,6 +1040,8 @@ static unsigned char *ej_tmp(unsigned *len)
  * volta, per convertirlo. */
 unsigned write_eeprom_patched(unsigned short addr, unsigned char *src)
 {
+    volatile unsigned short ramcode[RAMCODE_HALFWORDS];
+    flashRamSetup(ramcode);
     flashSetWaitState();
     struct eeprom_meta *eeprom_meta = get_eeprom_meta();
     /* Il limite che controllavano le funzioni originali, con lo stesso
@@ -801,18 +1049,28 @@ unsigned write_eeprom_patched(unsigned short addr, unsigned char *src)
      * Se i metadati mancano il limite non e' noto e non si controlla. */
     if (eeprom_meta && addr >= eeprom_meta->addrs)
         return 1;
+    if (flash_chip() & CF_ATMEL)
+        return atmel_eeprom_write(addr, src) ? 0 : 1;
     return ej_write_block(addr, src, eeprom_loadfactor(eeprom_meta)) ? 0 : 1;
 }
 
 unsigned read_eeprom_patched(unsigned short addr, unsigned char *dst)
 {
+    volatile unsigned short ramcode[RAMCODE_HALFWORDS];
+    flashRamSetup(ramcode);
     flashSetWaitState();
+    if (flash_chip() & CF_ATMEL)
+        return atmel_eeprom_read(addr, dst) ? 0 : 1;
     return ej_read_block(addr, dst, eeprom_loadfactor(get_eeprom_meta())) ? 0 : 1;
 }
 
 unsigned verify_eeprom_patched(unsigned short addr, unsigned char *src)
 {
+    volatile unsigned short ramcode[RAMCODE_HALFWORDS];
+    flashRamSetup(ramcode);
     flashSetWaitState();
+    if (flash_chip() & CF_ATMEL)
+        return atmel_eeprom_verify(addr, src) ? 0 : 1;
     unsigned char cur[8];
     if (!ej_read_block(addr, cur, eeprom_loadfactor(get_eeprom_meta())))
         return 1;
@@ -868,21 +1126,33 @@ static int eeprom_fixed6_loadfactor(void)
 
 unsigned write_eeprom_fixed6_patched(unsigned short addr, unsigned char *src)
 {
+    volatile unsigned short ramcode[RAMCODE_HALFWORDS];
+    flashRamSetup(ramcode);
     flashSetWaitState();
     if (addr > EEPROM_FIXED6_MAX_ADDR)
         return 0;
+    if (flash_chip() & CF_ATMEL)
+        return atmel_eeprom_write(addr, src) ? 0 : 1;
     return ej_write_block(addr, src, eeprom_fixed6_loadfactor()) ? 0 : 1;
 }
 
 unsigned read_eeprom_fixed6_patched(unsigned short addr, unsigned char *dst)
 {
+    volatile unsigned short ramcode[RAMCODE_HALFWORDS];
+    flashRamSetup(ramcode);
     flashSetWaitState();
+    if (flash_chip() & CF_ATMEL)
+        return atmel_eeprom_read(addr, dst) ? 0 : 1;
     return ej_read_block(addr, dst, eeprom_fixed6_loadfactor()) ? 0 : 1;
 }
 
 unsigned verify_eeprom_fixed6_patched(unsigned short addr, unsigned char *src)
 {
+    volatile unsigned short ramcode[RAMCODE_HALFWORDS];
+    flashRamSetup(ramcode);
     flashSetWaitState();
+    if (flash_chip() & CF_ATMEL)
+        return atmel_eeprom_verify(addr, src) ? 0 : 0x8000;
     unsigned char cur[8];
     if (!ej_read_block(addr, cur, eeprom_fixed6_loadfactor()))
         return 0x8000;
